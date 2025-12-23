@@ -7,7 +7,10 @@ authors = [
     { name = "lookas", email = "i@18kas.com" }
 ]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "av>=16.0.1",
+    "torch>=2.9.1",
+]
 
 [project.scripts]
 haiqin-robotics-toolbox = "haiqin_robotics_toolbox:main"
