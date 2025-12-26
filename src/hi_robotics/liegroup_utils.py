@@ -40,89 +40,83 @@ def so3_vee(h: torch.Tensor) -> torch.Tensor:
     return v
 
 
-def so3_hat(v: torch.Tensor) -> torch.Tensor:
+def so3_hat(phi: torch.Tensor) -> torch.Tensor:
     """
     Compute the Hat operator [1] of a batch of 3D vectors.
 
     Args:
-        v: Batch of vectors of shape `(minibatch, 3)`.
+        phi: Batch of vectors of shape `(minibatch, 3)`.
 
     Returns:
         Batch of skew-symmetric matrices of shape
         `(minibatch, 3, 3)` where each matrix is of the form:
-            `[    0  -v_z   v_y ]
-             [  v_z     0  -v_x ]
-             [ -v_y   v_x     0 ]`
+            `[      0 -phi_z  phi_y ]
+             [  phi_z      0 -phi_x ]
+             [ -phi_y  phi_x      0 ]`
 
     Raises:
-        ValueError if `v` is of incorrect shape.
+        ValueError if `phi` is of incorrect shape.
 
     [1] https://en.wikipedia.org/wiki/Hat_operator
     """
 
-    N, dim = v.shape
+    N, dim = phi.shape
     if dim != 3:
         raise ValueError("Input vectors have to be 3-dimensional.")
 
-    h = torch.zeros((N, 3, 3), dtype=v.dtype, device=v.device)
+    # h = torch.zeros((N, 3, 3), dtype=phi.dtype, device=phi.device)
 
-    x, y, z = v.unbind(1)
+    # x, y, z = phi.unbind(1)
 
-    h[:, 0, 1] = -z
-    h[:, 0, 2] = y
-    h[:, 1, 0] = z
-    h[:, 1, 2] = -x
-    h[:, 2, 0] = -y
-    h[:, 2, 1] = x
+    # h[:, 0, 1] = -z
+    # h[:, 0, 2] = y
+    # h[:, 1, 0] = z
+    # h[:, 1, 2] = -x
+    # h[:, 2, 0] = -y
+    # h[:, 2, 1] = x
 
-    return h
+    # return h
+
+    rx, ry, rz = phi[..., 0], phi[..., 1], phi[..., 2]
+    zeros = torch.zeros(phi.shape[:-1], dtype=phi.dtype, device=phi.device)
+    return torch.stack(
+        [zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=-1
+    ).view(phi.shape + (3,))
 
 
-def so3_expmap(log_rot: torch.Tensor) -> torch.Tensor:
+def so3_expmap(phi: torch.Tensor) -> torch.Tensor:
     """
-    Convert a batch of logarithmic representations of rotation matrices `log_rot`
+    Convert a batch of logarithmic representations of rotation matrices `phi`
     to a batch of 3x3 rotation matrices using Rodrigues formula [1].
 
     In the logarithmic representation, each rotation matrix is represented as
-    a 3-dimensional vector (`log_rot`) who's l2-norm and direction correspond
+    a 3-dimensional vector (`phi`) who's l2-norm and direction correspond
     to the magnitude of the rotation angle and the axis of rotation respectively.
 
     Args:
-        log_rot: Batch of vectors of shape `(minibatch, 3)`.
+        phi: Batch of vectors of shape `(minibatch, 3)`.
 
     Returns:
         Batch of rotation matrices of shape `(minibatch, 3, 3)`.
 
     Raises:
-        ValueError if `log_rot` is of incorrect shape.
+        ValueError if `phi` is of incorrect shape.
 
     [1] https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula
     """
-    _, dim = log_rot.shape
+    _, dim = phi.shape
     if dim != 3:
         raise ValueError("Input tensor shape has to be Nx3.")
 
-    shape = log_rot.shape
-    device, dtype = log_rot.device, log_rot.dtype
+    theta = torch.norm(phi, dim=-1)
 
-    angles = torch.norm(log_rot, p=2, dim=-1, keepdim=True).unsqueeze(-1)
+    B = torch.sinc(theta / torch.pi)
+    C = torch.where(theta * theta == 0, 0, (1 - torch.cos(theta)) / (theta**2))
+    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
+    W = so3_hat(phi)
+    WW = W @ W
 
-    rx, ry, rz = log_rot[..., 0], log_rot[..., 1], log_rot[..., 2]
-    zeros = torch.zeros(shape[:-1], dtype=dtype, device=device)
-    cross_product_matrix = torch.stack(
-        [zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=-1
-    ).view(shape + (3,))
-    cross_product_matrix_sqrd = cross_product_matrix @ cross_product_matrix
-
-    identity = torch.eye(3, dtype=dtype, device=device)
-    angles_sqrd = angles * angles
-    angles_sqrd = torch.where(angles_sqrd == 0, 1, angles_sqrd)
-    return (
-        identity.expand(cross_product_matrix.shape)
-        + torch.sinc(angles / torch.pi) * cross_product_matrix
-        + ((1 - torch.cos(angles)) / angles_sqrd) * cross_product_matrix_sqrd
-    )
-
+    return I + B * W + C * WW
 
 def so3_logmap(R: torch.Tensor) -> torch.Tensor:
     """
@@ -145,104 +139,36 @@ def so3_logmap(R: torch.Tensor) -> torch.Tensor:
     if R.size(-1) != 3 or R.size(-2) != 3:
         raise ValueError(f"Invalid rotation R shape {R.shape}.")
 
-    omegas = torch.stack([
+    sin_theta_axis = torch.stack([ # vee # sin(theta) * e
         R[..., 2, 1] - R[..., 1, 2],
         R[..., 0, 2] - R[..., 2, 0],
         R[..., 1, 0] - R[..., 0, 1],
-    ], dim=-1)
-    norms = torch.norm(omegas, p=2, dim=-1, keepdim=True)
-    traces = torch.diagonal(R, dim1=-2, dim2=-1).sum(-1).unsqueeze(-1)
-    angles = torch.atan2(norms, traces - 1)
-
-    zeros = torch.zeros(3, dtype=R.dtype, device=R.device)
-    omegas = torch.where(torch.isclose(angles, torch.zeros_like(angles)), zeros, omegas)
-
-    near_pi = angles.isclose(angles.new_full((1,), torch.pi)).squeeze(-1)
-
-    axis_angles = torch.empty_like(omegas)
-    axis_angles[~near_pi] = (
-        0.5 * omegas[~near_pi] / torch.sinc(angles[~near_pi] / torch.pi)
+    ], dim=-1) * 0.5
+    theta = torch.atan2(
+        torch.norm(sin_theta_axis, p=2, dim=-1) * 2.,
+        torch.diagonal(R, dim1=-2, dim2=-1).sum(-1) - 1
     )
 
     # this derives from: nnT = (R + 1) / 2
-    n = 0.5 * (
-        R[near_pi][..., 0, :]
-        + torch.eye(1, 3, dtype=R.dtype, device=R.device)
+    n = 0.5 * (R + torch.eye(3, dtype=R.dtype, device=R.device).unsqueeze(0))
+    n_norm = torch.norm(n, dim=-1, keepdim=True)
+
+    return torch.where(torch.isclose(theta, theta.new_full((1,), torch.pi)),
+        theta * (n / n_norm)[:,torch.argmax(n_norm)],
+        torch.where(torch.isclose(theta, torch.zeros_like(theta)),
+            torch.zeros(3, dtype=R.dtype, device=R.device),
+            sin_theta_axis / torch.sinc(theta / torch.pi)
+        ),
     )
-    axis_angles[near_pi] = angles[near_pi] * n / torch.norm(n)
 
-    return axis_angles
-
+# Test cases for edge cases
+# so3_logmap(torch.tensor([[[-1,0,0],[0,-1,0],[0,0,1.]]]))
 
 # Copy from: https://github.com/princeton-vl/lietorch/blob/e7df86554156b36846008d8ddbcc4d8521a16554/lietorch/include/rxso3.h
 # See: https://github.com/borglab/gtsam/blob/ef33d45aea433da506447759ec949af30dc8e38f/gtsam/geometry/Similarity3.cpp
 # See: https://jinyongjeong.github.io/Download/SE3/jlblanco2010geometry3d_techrep.pdf
 
 EPS = 1e-6
-
-
-def _se3_get_V(phi: torch.Tensor):
-    """
-    _se3_get_V
-
-    No clamp version
-
-    A helper function that computes the "V" matrix from [1], Sec 9.4.2.
-    [1] https://jinyongjeong.github.io/Download/SE3/jlblanco2010geometry3d_techrep.pdf
-
-    :param phi: shape == (B, 3)
-    :type phi: torch.Tensor
-    :return: shape == (B, 3, 3)
-    :rtype: torch.Tensor
-    """
-
-    theta = torch.norm(phi, dim=-1) # shape == (B,)
-
-    C = torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0)
-
-    A = torch.where(torch.abs(theta) < EPS,
-        torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        (1. - torch.cos(theta)) / (theta**2),
-    )
-
-    B = torch.where(torch.abs(theta) < EPS,
-        torch.tensor(1. / 6., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        (theta - torch.sin(theta)) / (theta**3),
-    )
-
-    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
-    W = so3_hat(phi)
-    WW = W @ W
-
-    return C * I + A * W + B * WW # shape == (B,3,3)
-
-
-def _se3_get_V_inv(phi: torch.Tensor):
-    """
-    _se3_get_V_inv
-
-    :param phi: shape == (B, 3)
-    :type phi: torch.Tensor
-    :return: shape == (B, 3, 3)
-    :rtype: torch.Tensor
-    """
-
-    theta = torch.norm(phi, dim=-1)
-
-    C = torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0)
-
-    A = torch.tensor(-0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0)
-
-    B = torch.where(torch.abs(theta) < EPS,
-        torch.tensor(1. / 12., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        (theta * torch.sin(theta) + 2. * torch.cos(theta) - 2.) / (2. * theta**2 * (torch.cos(theta) - 1.)), # theta接近0的时候，
-    )
-
-    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
-    W = so3_hat(phi)
-    WW = W @ W
-
-    return C * I + A * W + B * WW
 
 
 def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
@@ -260,18 +186,18 @@ def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
     SE(3) matrices are commonly used to represent rigid motions or camera extrinsics.
 
     In the SE(3) logarithmic representation SE(3) matrices are
-    represented as 6-dimensional vectors `[log_rotation | log_translation]`,
-    i.e. a concatenation of two 3D vectors `log_rotation` and `log_translation`.
+    represented as 6-dimensional vectors `[phi | log_translation]`,
+    i.e. a concatenation of two 3D vectors `phi` and `log_translation`.
 
     The conversion from the 6D representation to a 4x4 SE(3) matrix `transform`
     is done as follows:
         ```
-        transform = exp( [ so3_hat(log_rotation) log_translation ]
+        transform = exp( [ so3_hat(phi) log_translation ]
                          [   0 1 ] ) ,
         ```
     where `exp` is the matrix exponential and `hat` is the Hat operator [2].
 
-    Note that for any `log_transform` with `0 <= ||log_rotation|| < 2pi`
+    Note that for any `log_transform` with `0 <= ||phi|| < 2pi`
     (i.e. the rotation angle is between 0 and 2pi), the following identity holds:
     ```
     se3_logmap(se3_exponential_map(log_transform)) == log_transform
@@ -296,12 +222,29 @@ def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
     N, _ = log_transform.shape
 
     log_translation = log_transform[..., 3:]
-    log_rotation = log_transform[..., :3]
+    phi = log_transform[..., :3]
 
-    R = so3_expmap(log_rotation)
+    R = so3_expmap(phi)
+
+    # A helper function that computes the "V" matrix from [1], Sec 9.4.2. [1] https://jinyongjeong.github.io/Download/SE3/jlblanco2010geometry3d_techrep.pdf
+
+    theta = torch.norm(phi, dim=-1) # shape == (B,)
+
+    A = torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0)
+    B = torch.where(torch.abs(theta) < EPS,
+        torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
+        (1. - torch.cos(theta)) / (theta**2),
+    )
+    C = torch.where(torch.abs(theta) < EPS,
+        torch.tensor(1. / 6., dtype=phi.dtype, device=phi.device).unsqueeze(0),
+        (theta - torch.sin(theta)) / (theta**3),
+    )
+    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
+    W = so3_hat(phi)
+    WW = W @ W
+    V = A * I + B * W + C * WW # shape == (B,3,3)
 
     # translation is V @ T
-    V = _se3_get_V(log_rotation)
     T = torch.bmm(V, log_translation[:, :, None])[:, :, 0]
 
     transform = torch.zeros(
@@ -330,15 +273,15 @@ def se3_logmap(transform: torch.Tensor) -> torch.Tensor:
     SE(3) matrices are commonly used to represent rigid motions or camera extrinsics.
 
     In the SE(3) logarithmic representation SE(3) matrices are
-    represented as 6-dimensional vectors `[log_rotation | log_translation]`,
-    i.e. a concatenation of two 3D vectors `log_rotation` and `log_translation`.
+    represented as 6-dimensional vectors `[phi | log_translation]`,
+    i.e. a concatenation of two 3D vectors `phi` and `log_translation`.
 
     The conversion from the 4x4 SE(3) matrix `transform` to the
-    6D representation `log_transform = [log_rotation | log_translation]`
+    6D representation `log_transform = [phi | log_translation]`
     is done as follows:
         ```
         log_transform = log(transform)
-        log_rotation = so3_vee(log_transform[:3, :3])
+        phi = so3_vee(log_transform[:3, :3])
         log_translation = log_transform[:3, 3]
         ```
     where `log` is the matrix logarithm
@@ -376,14 +319,27 @@ def se3_logmap(transform: torch.Tensor) -> torch.Tensor:
 
     # log_rot is just so3_logmap of the upper left 3x3 block
     R = transform[:, :3, :3]
-    log_rotation = so3_logmap(R)
+    phi = so3_logmap(R)
 
     # log_translation is V^-1 @ T
     T = transform[:, :3, 3]
 
-    log_translation = (_se3_get_V_inv(log_rotation) @ T[:, :, None])[:, :, 0]
+    theta = torch.norm(phi, dim=-1)
 
-    return torch.cat((log_rotation, log_translation), dim=1)
+    A = torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0)
+    B = torch.tensor(-0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0)
+    C = torch.where(torch.abs(theta) < EPS,
+        torch.tensor(1. / 12., dtype=phi.dtype, device=phi.device).unsqueeze(0),
+        (theta * torch.sin(theta) + 2. * torch.cos(theta) - 2.) / (2. * theta**2 * (torch.cos(theta) - 1.)), # theta接近0的时候，
+    )
+    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
+    W = so3_hat(phi)
+    WW = W @ W
+    V_inv = A * I + B * W + C * WW
+
+    log_translation = (V_inv @ T[:, :, None])[:, :, 0]
+
+    return torch.cat((phi, log_translation), dim=1)
 
 
 def se3_inv(A: torch.Tensor) -> torch.Tensor:
@@ -463,84 +419,32 @@ def one_minus_cos(theta: torch.Tensor):
     return 2. * (torch.sin(0.5 * theta) ** 2) # Better numeric stability
 
 
-def _sim3_get_V(phi: torch.Tensor, sigma: torch.Tensor):
-    """
-    _sim3_get_V
+def sim3_logmap(T: torch.Tensor):
+    # To get the logmap, calculate phi and sigma, then solve for u as shown by Ethan at
+    # See: https://www.ethaneade.org/latex2html/lie/node29.html
+    # See: https://www.ethaneade.com/lie.pdf
+    # See: https://www.cis.upenn.edu/~jean/interp-SIM.pdf
+    s = torch.norm(T[:, :3, :3], dim=(1,2)) / torch.sqrt(torch.tensor(3.0, dtype=T.dtype, device=T.device).unsqueeze(0)) # shape == (B,)
+    R = T[:, :3, :3] / s.unsqueeze(-1).unsqueeze(-1) # shape == (B,3,3)
+    t = T[:, :3, 3] # shape == (B,3)
 
-    :param phi: shape == (B, 3)
-    :type phi: torch.Tensor
-    :param sigma: shape == (B, 1)
-    :type sigma: torch.Tensor
-    :return: shape == (B, 3, 3)
-    :rtype: torch.Tensor
-    """
+    sigma = torch.log(s) # shape == (B,)
+    phi = so3_logmap(R) # shape == (B,3)
 
     theta = torch.norm(phi, dim=-1) # shape == (B,)
-    sigma = sigma.squeeze(-1) # shape == (B,)
-
-    C = torch.where(torch.abs(sigma) < EPS,
-        torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        ((torch.expm1(sigma) + 1.) - 1.) / sigma,
-    )
 
     A = torch.where(torch.abs(sigma) < EPS,
-        torch.where(torch.abs(theta) < EPS,
-            torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
-            (1. - (1. - one_minus_cos(theta))) / (theta**2),
-        ),
-        torch.where(torch.abs(theta) < EPS,
-            ((sigma - 1.) * (torch.expm1(sigma) + 1.) + 1.) / (sigma**2),
-            ((torch.expm1(sigma) + 1.) * torch.sin(theta) * sigma + (1. - (torch.expm1(sigma) + 1.) * (1. - one_minus_cos(theta))) * theta) / (theta * (theta**2 + sigma**2)),
-        ),
-    )
-
-    B = torch.where(torch.abs(sigma) < EPS,
-        torch.where(torch.abs(theta) < EPS,
-            torch.tensor(1. / 6., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-            (theta - torch.sin(theta)) / (theta**3),
-        ),
-        torch.where(torch.abs(theta) < EPS,
-            ((torch.expm1(sigma) + 1.) * 0.5 * sigma**2 + (torch.expm1(sigma) + 1.) - 1. - sigma * (torch.expm1(sigma) + 1.)) / (sigma**3),
-            (((torch.expm1(sigma) + 1.) - 1.) / sigma - (((torch.expm1(sigma) + 1.) * (1. - one_minus_cos(theta)) - 1.) * sigma + (torch.expm1(sigma) + 1.) * torch.sin(theta) * theta) / (theta**2 + sigma**2)) / (theta**2),
-        ),
-    )
-
-    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
-    W = so3_hat(phi)
-    WW = W @ W
-
-    return C * I + A * W + B * WW # shape == (B,3,3)
-
-
-def _sim3_get_V_inv(phi: torch.Tensor, sigma: torch.Tensor):
-    """
-    _sim3_get_V_inv
-
-    :param phi: shape == (B, 3)
-    :type phi: torch.Tensor
-    :param sigma: shape == (B, 1)
-    :type sigma: torch.Tensor
-    :return: shape == (B, 3, 3)
-    :rtype: torch.Tensor
-    """
-
-    theta = torch.norm(phi, dim=-1) # shape == (B,)
-    sigma = sigma.squeeze(-1) # shape == (B,)
-
-    C = torch.where(torch.abs(sigma) < EPS,
         1. - 0.5 * sigma,
         sigma / ((torch.expm1(sigma) + 1.) - 1.),
     )
-
-    A = torch.where(torch.abs(sigma) < EPS,
+    B = torch.where(torch.abs(sigma) < EPS,
         torch.tensor(-0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
         torch.where(torch.abs(theta) < EPS,
             (-sigma * (torch.expm1(sigma) + 1.) + (torch.expm1(sigma) + 1.) - 1.) / (((torch.expm1(sigma) + 1.) - 1.) * ((torch.expm1(sigma) + 1.) - 1.)),
             (theta * (torch.expm1(sigma) + 1.) * (1. - one_minus_cos(theta)) - theta - sigma * (torch.expm1(sigma) + 1.) * torch.sin(theta)) / (theta * ((torch.expm1(sigma) + 1.)**2 - 2. * (torch.expm1(sigma) + 1.) * (1. - one_minus_cos(theta)) + 1.)),
         ),
     )
-
-    B = torch.where(torch.abs(sigma) < EPS,
+    C = torch.where(torch.abs(sigma) < EPS,
         torch.where(torch.abs(theta) < EPS,
             torch.tensor(1. / 12., dtype=phi.dtype, device=phi.device).unsqueeze(0),
             (theta * torch.sin(theta) + 2. * (1. - one_minus_cos(theta)) - 2.) / (2. * theta**2 * ((1. - one_minus_cos(theta)) - 1.)),
@@ -550,28 +454,14 @@ def _sim3_get_V_inv(phi: torch.Tensor, sigma: torch.Tensor):
             -(torch.expm1(sigma) + 1.) * (theta * (torch.expm1(sigma) + 1.) * torch.sin(theta) - theta * torch.sin(theta) + sigma * (torch.expm1(sigma) + 1.) * (1. - one_minus_cos(theta)) - (torch.expm1(sigma) + 1.) * sigma + sigma * (1. - one_minus_cos(theta)) - sigma) / (theta**2 * ((torch.expm1(sigma) + 1.)**2 - 2. * (torch.expm1(sigma) + 1.) * (1. - one_minus_cos(theta)) + 1.) * ((torch.expm1(sigma) + 1.) - 1.)), # Better numberic stability
         ),
     )
-
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
+    V_inv = A * I + B * W + C * WW
 
-    return C * I + A * W + B * WW
+    rho = (V_inv @ t.unsqueeze(-1)).squeeze(-1) # shape == (B,3)
 
-
-def sim3_logmap(T: torch.Tensor):
-    # To get the logmap, calculate w and lambda, then solve for u as shown by Ethan at
-    # See: https://www.ethaneade.org/latex2html/lie/node29.html
-    # See: https://www.ethaneade.com/lie.pdf
-    # See: https://www.cis.upenn.edu/~jean/interp-SIM.pdf
-    s = torch.norm(T[:, :3, :3], dim=(1,2)) / torch.sqrt(torch.tensor(3.0, dtype=T.dtype, device=T.device).unsqueeze(0)) # shape == (B,)
-    R = T[:, :3, :3] / s.unsqueeze(-1).unsqueeze(-1) # shape == (B,3,3)
-    t = T[:, :3, 3] # shape == (B,3)
-
-    lamb = torch.log(s).unsqueeze(-1) # shape == (B,1)
-    w = so3_logmap(R) # shape == (B,3)
-    rho = (_sim3_get_V_inv(w, lamb) @ t.unsqueeze(-1)).squeeze(-1) # shape == (B,3)
-
-    v = torch.concat([ lamb, w, rho ], dim=-1)
+    v = torch.concat([ sigma.unsqueeze(-1), phi, rho ], dim=-1)
     return v
 
 
@@ -580,13 +470,45 @@ def sim3_expmap(v: torch.Tensor):
     if dim1 != 7:
         raise ValueError("Input tensor shape has to be Nx7.")
 
-    lamb = v[:,0:1] # shape == (B,1)
-    w = v[:,1:4] # shape == (B,3)
+    sigma = v[:,0] # shape == (B,)
+    phi = v[:,1:4] # shape == (B,3)
     rho = v[:,4:7] # shape == (B,3)
 
-    R = so3_expmap(w) # shape == (B,3,3)
-    t = (_sim3_get_V(w, lamb) @ rho.unsqueeze(-1)).squeeze(-1) # shape == (B,3)
-    s = torch.exp(lamb.squeeze(-1)) # shape == (B,)
+    R = so3_expmap(phi) # shape == (B,3,3)
+
+    theta = torch.norm(phi, dim=-1) # shape == (B,)
+
+    A = torch.where(torch.abs(sigma) < EPS,
+        torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0),
+        ((torch.expm1(sigma) + 1.) - 1.) / sigma,
+    )
+    B = torch.where(torch.abs(sigma) < EPS,
+        torch.where(torch.abs(theta) < EPS,
+            torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
+            (1. - (1. - one_minus_cos(theta))) / (theta**2),
+        ),
+        torch.where(torch.abs(theta) < EPS,
+            ((sigma - 1.) * (torch.expm1(sigma) + 1.) + 1.) / (sigma**2),
+            ((torch.expm1(sigma) + 1.) * torch.sin(theta) * sigma + (1. - (torch.expm1(sigma) + 1.) * (1. - one_minus_cos(theta))) * theta) / (theta * (theta**2 + sigma**2)),
+        ),
+    )
+    C = torch.where(torch.abs(sigma) < EPS,
+        torch.where(torch.abs(theta) < EPS,
+            torch.tensor(1. / 6., dtype=phi.dtype, device=phi.device).unsqueeze(0),
+            (theta - torch.sin(theta)) / (theta**3),
+        ),
+        torch.where(torch.abs(theta) < EPS,
+            ((torch.expm1(sigma) + 1.) * 0.5 * sigma**2 + (torch.expm1(sigma) + 1.) - 1. - sigma * (torch.expm1(sigma) + 1.)) / (sigma**3),
+            (((torch.expm1(sigma) + 1.) - 1.) / sigma - (((torch.expm1(sigma) + 1.) * (1. - one_minus_cos(theta)) - 1.) * sigma + (torch.expm1(sigma) + 1.) * torch.sin(theta) * theta) / (theta**2 + sigma**2)) / (theta**2),
+        ),
+    )
+    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
+    W = so3_hat(phi)
+    WW = W @ W
+    V = A * I + B * W + C * WW # shape == (B,3,3)
+
+    t = (V @ rho.unsqueeze(-1)).squeeze(-1) # shape == (B,3)
+    s = torch.exp(sigma) # shape == (B,)
 
     T = torch.zeros((N, 4, 4), dtype=v.dtype, device=v.device)
     T[:, :3, :3] = R * s.unsqueeze(-1).unsqueeze(-1)
