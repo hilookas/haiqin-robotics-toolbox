@@ -441,7 +441,7 @@ def sim3_logmap(T: torch.Tensor):
         torch.tensor(-0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
         torch.where(torch.abs(theta) < EPS,
             (-sigma + (1 - sigma)*torch.expm1(sigma))/torch.expm1(sigma)**2,
-            (-sigma*torch.expm1(sigma)*torch.sin(theta) - sigma*torch.sin(theta) - theta*torch.expm1(sigma)*one_minus_cos(theta) + theta*torch.expm1(sigma) - theta*one_minus_cos(theta)) / (theta*(torch.expm1(sigma)**2 + 2.0*torch.expm1(sigma)*one_minus_cos(theta) + 2.0*one_minus_cos(theta))),
+            (-sigma*torch.expm1(sigma)*torch.sin(theta) - sigma*torch.sin(theta) - theta*torch.expm1(sigma)*one_minus_cos(theta) + theta*torch.expm1(sigma) - theta*one_minus_cos(theta))/(theta*(torch.expm1(sigma)**2 + 2.0*torch.expm1(sigma)*one_minus_cos(theta) + 2.0*one_minus_cos(theta))),
         ),
     )
     C = torch.where(torch.abs(sigma) < EPS,
