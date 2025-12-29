@@ -1,9 +1,22 @@
 # Python Native LieGroup operations (SO3, SE3, RxSO3, Sim3) for PyTorch
 
+# See: "A micro Lie theory for state estimation in robotics" pp. 13 for linearized optimization used in SLAM
+# See: "A tutorial on SE(3) transformation parameterizations and on-manifold optimization" for derived exp/log map and its jacobians of SE3
+# See: "Lie Groups for 2D and 3D Transformations" for Sim3 exp/log maps derivation
+
 # Copy from: https://github.com/facebookresearch/pytorch3d/blob/33824be3cbc87a7dd1db0f6a9a9de9ac81b2d0ba/pytorch3d/transforms/se3.py
 # See: https://github.com/borglab/gtsam/blob/ef33d45aea433da506447759ec949af30dc8e38f/gtsam/geometry/Pose3.cpp
 
 import torch
+
+from torch.autograd.function import Function, FunctionCtx
+
+EPS = 1e-6
+
+
+def one_minus_cos(theta: torch.Tensor):
+    # 1. - torch.cos(theta)
+    return 2. * (torch.sin(0.5 * theta) ** 2) # Better numeric stability
 
 
 def so3_vee(h: torch.Tensor) -> torch.Tensor:
@@ -27,17 +40,10 @@ def so3_vee(h: torch.Tensor) -> torch.Tensor:
     if dim1 != 3 or dim2 != 3:
         raise ValueError("Input has to be a batch of 3x3 Tensors.")
 
-    HAT_INV_SKEW_SYMMETRIC_TOL = 1e-5
-    if float(torch.abs(h + h.permute(0, 2, 1)).max()) > HAT_INV_SKEW_SYMMETRIC_TOL:
-        raise ValueError("One of input matrices is not skew-symmetric.")
-
-    x = h[:, 2, 1]
-    y = h[:, 0, 2]
-    z = h[:, 1, 0]
-
-    v = torch.stack((x, y, z), dim=1)
-
-    return v
+    x = (h[:, 2, 1] - h[:, 1, 2]) / 2
+    y = (h[:, 0, 2] - h[:, 2, 0]) / 2
+    z = (h[:, 1, 0] - h[:, 0, 1]) / 2
+    return torch.stack((x, y, z), dim=1)
 
 
 def so3_hat(phi: torch.Tensor) -> torch.Tensor:
@@ -64,24 +70,9 @@ def so3_hat(phi: torch.Tensor) -> torch.Tensor:
     if dim != 3:
         raise ValueError("Input vectors have to be 3-dimensional.")
 
-    # h = torch.zeros((N, 3, 3), dtype=phi.dtype, device=phi.device)
-
-    # x, y, z = phi.unbind(1)
-
-    # h[:, 0, 1] = -z
-    # h[:, 0, 2] = y
-    # h[:, 1, 0] = z
-    # h[:, 1, 2] = -x
-    # h[:, 2, 0] = -y
-    # h[:, 2, 1] = x
-
-    # return h
-
     rx, ry, rz = phi[..., 0], phi[..., 1], phi[..., 2]
-    zeros = torch.zeros(phi.shape[:-1], dtype=phi.dtype, device=phi.device)
-    return torch.stack(
-        [zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=-1
-    ).view(phi.shape + (3,))
+    zeros = torch.zeros_like(rx)
+    return torch.stack([zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=-1).view(phi.shape + (3,)) # shape == (N,3,3)
 
 
 def so3_expmap(phi: torch.Tensor) -> torch.Tensor:
@@ -111,14 +102,27 @@ def so3_expmap(phi: torch.Tensor) -> torch.Tensor:
     theta = torch.norm(phi, dim=-1)
 
     B = torch.sinc(theta / torch.pi)
-    C = torch.where(theta * theta == 0, 0, (1 - torch.cos(theta)) / (theta**2))
+    C = torch.where(theta**2 == 0,
+        torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
+        one_minus_cos(theta) / (theta**2)
+    )
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
 
     return I + B * W + C * WW
 
-def so3_logmap(R: torch.Tensor) -> torch.Tensor:
+
+def test_so3_expmap():
+    assert (so3_expmap(torch.tensor([[0., 0., 0.]])) == torch.eye(3).unsqueeze(0)).all()  # Should be identity
+    # print(so3_expmap(torch.tensor([[0., 0., 1e-13]])))
+
+    # import ipdb; ipdb.set_trace()
+
+test_so3_expmap()
+
+
+def so3_logmap(R: torch.Tensor, eps: float = None) -> torch.Tensor:
     """
     Convert a batch of 3x3 rotation matrices `R`
     to a batch of 3-dimensional matrix logarithms of rotation matrices
@@ -131,6 +135,11 @@ def so3_logmap(R: torch.Tensor) -> torch.Tensor:
         Batch of logarithms of input rotation matrices
         of shape `(minibatch, 3)`.
     """
+    if eps is None:
+        if R.dtype == torch.float64:
+            eps = 1e-8
+        else:
+            eps = 1e-4
 
     N, dim1, dim2 = R.shape
     if dim1 != 3 or dim2 != 3:
@@ -139,36 +148,147 @@ def so3_logmap(R: torch.Tensor) -> torch.Tensor:
     if R.size(-1) != 3 or R.size(-2) != 3:
         raise ValueError(f"Invalid rotation R shape {R.shape}.")
 
-    sin_theta_axis = torch.stack([ # vee # sin(theta) * e
-        R[..., 2, 1] - R[..., 1, 2],
-        R[..., 0, 2] - R[..., 2, 0],
-        R[..., 1, 0] - R[..., 0, 1],
-    ], dim=-1) * 0.5
-    theta = torch.atan2(
-        torch.norm(sin_theta_axis, p=2, dim=-1) * 2.,
-        torch.diagonal(R, dim1=-2, dim2=-1).sum(-1) - 1
+    sin_theta_axis = so3_vee(R) # sin(theta) * e
+    theta = torch.atan2( # avoid acos
+        torch.norm(sin_theta_axis, p=2, dim=-1) * 2., # 2 * sin(theta)
+        torch.diagonal(R, dim1=-2, dim2=-1).sum(-1) - 1. # trace(R) - 1
     )
 
     # this derives from: nnT = (R + 1) / 2
-    n = 0.5 * (R + torch.eye(3, dtype=R.dtype, device=R.device).unsqueeze(0))
+    n = (R + torch.eye(3, dtype=R.dtype, device=R.device).unsqueeze(0)) * 0.5
     n_norm = torch.norm(n, dim=-1, keepdim=True)
 
-    return torch.where(torch.isclose(theta, theta.new_full((1,), torch.pi)),
+    return torch.where(torch.pi - theta < eps,
         theta * (n / n_norm)[:,torch.argmax(n_norm)],
-        torch.where(torch.isclose(theta, torch.zeros_like(theta)),
-            torch.zeros(3, dtype=R.dtype, device=R.device),
-            sin_theta_axis / torch.sinc(theta / torch.pi)
-        ),
+        sin_theta_axis / torch.sinc(theta / torch.pi)
     )
 
-# Test cases for edge cases
-# so3_logmap(torch.tensor([[[-1,0,0],[0,-1,0],[0,0,1.]]]))
+
+def plot_so3_singularity_near_pi():
+    # Copy from: https://github.com/dfki-ric/pytransform3d/issues/43
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(20, 10))
+    diffs = np.logspace(-13, -1, 101)
+    eps_candidates = np.logspace(-10, -3, 9)
+    for plot_idx, eps in enumerate(eps_candidates):
+        ax = plt.subplot(3, 3, plot_idx + 1)
+        axis_dists = []
+        for diff in diffs:
+            theta = np.pi - diff
+            a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float64)
+            # a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
+
+            R = so3_expmap(torch.tensor(a).unsqueeze(0))
+            a2 = so3_logmap(R, eps).squeeze(0).numpy()
+
+            axis_dist = np.linalg.norm((a - a2)) / theta
+            axis_dists.append(axis_dist)
+        plt.plot(diffs, axis_dists, label="eps = %g" % eps)
+
+        if plot_idx > 5:
+            ax.set_xlabel("$x = \\pi - $ angle")
+        if plot_idx % 3 == 0:
+            ax.set_ylabel("error = $||a[:3]$ - $\\ln(\\exp$ (a))[:3]$||_2$")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_ylim((10e-16, 10e-1))
+        ax.legend()
+    plt.tight_layout()
+    plt.savefig("so3_singularity_near_pi.png")
+
+# plot_so3_singularity_near_pi()
+
+
+def plot_so3_singularity_near_zero():
+    # Copy from: https://github.com/dfki-ric/pytransform3d/issues/43
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(20, 10))
+    diffs = np.logspace(-13, -1, 101)
+    eps_candidates = np.logspace(-10, -3, 9)
+    for plot_idx, eps in enumerate(eps_candidates):
+        ax = plt.subplot(3, 3, plot_idx + 1)
+        axis_dists = []
+        for diff in diffs:
+            theta = diff
+            a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float64)
+            # a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
+
+            R = so3_expmap(torch.tensor(a).unsqueeze(0))
+            a2 = so3_logmap(R, eps).squeeze(0).numpy()
+
+            axis_dist = np.linalg.norm((a - a2)) / theta
+            axis_dists.append(axis_dist)
+        plt.plot(diffs, axis_dists, label="eps = %g" % eps)
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        # ax.set_ylim((10e-16, 10e-1))
+        ax.legend()
+    plt.tight_layout()
+    plt.savefig("so3_singularity_near_zero.png")
+
+# plot_so3_singularity_near_zero()
+
+
+def test_so3_logmap():
+    assert (so3_logmap(torch.eye(3).unsqueeze(0)) == torch.zeros(3).unsqueeze(0)).all()  # Should be close to zero vector
+    import numpy as np
+
+    for diff in np.logspace(-13, -1, 101):
+        theta = np.pi - diff
+        a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float64)
+
+        R = so3_expmap(torch.tensor(a).unsqueeze(0))
+        a2 = so3_logmap(R).squeeze(0).numpy()
+
+        axis_dist = np.linalg.norm((a - a2)) / theta
+        assert axis_dist < 1e-7, f"axis_dist={axis_dist}, diff={diff}"
+
+    for diff in np.logspace(-13, -1, 101):
+        theta = np.pi - diff
+        a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
+
+        R = so3_expmap(torch.tensor(a).unsqueeze(0))
+        a2 = so3_logmap(R).squeeze(0).numpy()
+
+        axis_dist = np.linalg.norm((a - a2)) / theta
+        assert axis_dist < 1e-3
+
+    for diff in np.logspace(-13, -1, 101):
+        theta = diff
+        a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float64)
+
+        R = so3_expmap(torch.tensor(a).unsqueeze(0))
+        a2 = so3_logmap(R).squeeze(0).numpy()
+
+        axis_dist = np.linalg.norm((a - a2)) / theta
+        assert axis_dist < 1e-16
+
+    for diff in np.logspace(-13, -1, 101):
+        theta = diff
+        a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
+
+        R = so3_expmap(torch.tensor(a).unsqueeze(0))
+        a2 = so3_logmap(R).squeeze(0).numpy()
+
+        axis_dist = np.linalg.norm((a - a2)) / theta
+        assert axis_dist == 0.0
+
+    # Test cases for edge cases
+    assert (so3_logmap(torch.tensor([[[-1,0,0],[0,-1,0],[0,0,1.]]])) == torch.tensor([[0,0,np.pi]])).all()  # 180 degree rotation around z axis
+    assert (so3_logmap(torch.tensor([[[1,0,0],[0,-1,0],[0,0,-1.]]])) == torch.tensor([[np.pi,0,0]])).all()  # 180 degree rotation around z axis
+
+test_so3_logmap()
+
 
 # Copy from: https://github.com/princeton-vl/lietorch/blob/e7df86554156b36846008d8ddbcc4d8521a16554/lietorch/include/rxso3.h
 # See: https://github.com/borglab/gtsam/blob/ef33d45aea433da506447759ec949af30dc8e38f/gtsam/geometry/Similarity3.cpp
 # See: https://jinyongjeong.github.io/Download/SE3/jlblanco2010geometry3d_techrep.pdf
 
-EPS = 1e-6
 
 
 def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
@@ -231,13 +351,13 @@ def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
     theta = torch.norm(phi, dim=-1) # shape == (B,)
 
     A = torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0)
-    B = torch.where(torch.abs(theta) < EPS,
+    B = torch.where(theta**2 == 0,
         torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        (1. - torch.cos(theta)) / (theta**2),
+        one_minus_cos(theta) / (theta**2),
     )
     C = torch.where(torch.abs(theta) < EPS,
         torch.tensor(1. / 6., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        (theta - torch.sin(theta)) / (theta**3),
+        (1. - torch.sinc(theta / torch.pi)) / (theta**2),
     )
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
@@ -245,7 +365,7 @@ def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
     V = A * I + B * W + C * WW # shape == (B,3,3)
 
     # translation is V @ T
-    T = torch.bmm(V, log_translation[:, :, None])[:, :, 0]
+    T = (V @ log_translation[:, :, None])[:, :, 0]
 
     transform = torch.zeros(
         N, 4, 4, dtype=log_transform.dtype, device=log_transform.device
@@ -359,7 +479,7 @@ def se3_inv(A: torch.Tensor) -> torch.Tensor:
     R = A[:, :3, :3]
     t = A[:, :3, 3]
     R_inv = R.permute(0, 2, 1)
-    t_inv = -torch.bmm(R_inv, t[:, :, None])[:, :, 0]
+    t_inv = -(R_inv @ t[:, :, None])[:, :, 0]
     A_inv = torch.zeros_like(A)
     A_inv[:, :3, :3] = R_inv
     A_inv[:, :3, 3] = t_inv
@@ -410,13 +530,6 @@ def sim3_inv(A: torch.Tensor) -> torch.Tensor:
 # Which is copied from: https://github.com/strasdat/Sophus/blob/d0b7315a0d90fc6143defa54596a3a95d9fa10ec/sophus/so3.hpp
 # MAGIC CODE!
 # See: https://github.com/borglab/gtsam/blob/ef33d45aea433da506447759ec949af30dc8e38f/gtsam/geometry/Similarity3.cpp
-
-EPS = 1e-6
-
-
-def one_minus_cos(theta: torch.Tensor):
-    # 1. - torch.cos(theta)
-    return 2. * (torch.sin(0.5 * theta) ** 2) # Better numeric stability
 
 
 def sim3_logmap(T: torch.Tensor):
