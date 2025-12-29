@@ -517,80 +517,87 @@ def sim3_expmap(v: torch.Tensor):
     return T
 
 
-# import sympy as sp
+def simplify_with_sympy():
+    import sympy as sp
 
-# class sp_expm1(sp.Function):
-#     def fdiff(self, argindex=1):
-#         return sp.exp(self.args[0])
+    class sp_expm1(sp.Function):
+        def fdiff(self, argindex=1):
+            return sp.exp(self.args[0])
 
-# class sp_one_minus_cos(sp.Function):
-#     def fdiff(self, argindex=1):
-#         return sp.sin(self.args[0])
+    class sp_one_minus_cos(sp.Function):
+        def fdiff(self, argindex=1):
+            return sp.sin(self.args[0])
 
-# sigma, theta = sp.symbols('sigma theta', real=True)
+    sigma, theta = sp.symbols('sigma theta', real=True)
 
-# expr = (-sigma * (sp_expm1(sigma) + 1.) + (sp_expm1(sigma) + 1.) - 1.) / (sp_expm1(sigma) * sp_expm1(sigma))
+    expr = (-sigma * (sp_expm1(sigma) + 1.) + (sp_expm1(sigma) + 1.) - 1.) / (sp_expm1(sigma) * sp_expm1(sigma))
 
-# simplified_expr = sp.simplify(sp.expand(expr))
+    simplified_expr = sp.simplify(sp.expand(expr))
 
-# print(sp.latex(simplified_expr))
-# print(simplified_expr)
+    print(sp.latex(simplified_expr))
+    print(simplified_expr)
 
-# # print(expr.diff(x))   # exp(x)
-# # f = lambdify(x, expr)
-# # print(f(1))        # 1.718281828459045
-# # print(f(1e-20))    # 1e-20, unlike exp(x)-1 which would evaluate to 0
+    # print(expr.diff(x))   # exp(x)
+    # f = lambdify(x, expr)
+    # print(f(1))        # 1.718281828459045
+    # print(f(1e-20))    # 1e-20, unlike exp(x)-1 which would evaluate to 0
+
+
+def test_se3():
+    # SE3 test
+    import pytransform3d.transformations as pt
+    import pytransform3d.rotations as pr
+    import numpy as np
+
+    T = pt.random_transform(np.random.default_rng(None))
+    print("original", T)
+    print()
+    print("pytransform3d", pt.exponential_coordinates_from_transform(T))
+    print("pytorch3d", se3_logmap(torch.tensor(T[None,]).float()))
+    print()
+    print("pytransform3d", pt.transform_from_exponential_coordinates(pt.exponential_coordinates_from_transform(T)))
+    print("pytorch3d", se3_expmap(se3_logmap(torch.tensor(T[None,]).float())))
+    print()
+    print(se3_inv(torch.tensor(T)[None,].float()))
+    print(pt.invert_transform(T))
+
+    import ipdb; ipdb.set_trace()
+
+
+def test_sim3():
+    # Sim3 test
+    import lietorch
+
+    print(lietorch.Sim3.exp(torch.tensor([[0,0,0,0,0,0,0.]])).matrix())
+    #                  scale  rot   trans              trans   rot scale
+    print(torch.tensor([[0., 0,0,0, 0,3,0]]))
+    print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 0.]])).matrix()))
+    print(torch.tensor([[0., 0,2,0, 0,3,0]]))
+    print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 0.]])).matrix()))
+    print(torch.tensor([[1., 0,0,0, 0,3,0]]))
+    print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 1.]])).matrix()))
+    print(torch.tensor([[1., 0,2,0, 0,3,0]]))
+    print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix()))
+    print()
+    print(torch.tensor([[1., 0,0,0, 0,0,2]]))
+    print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix()))
+    print()
+    print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 0.]])).matrix())
+    print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 0.]])).matrix())))
+    print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 0.]])).matrix())
+    print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 0.]])).matrix())))
+    print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 1.]])).matrix())
+    print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 1.]])).matrix())))
+    print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix())
+    print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix())))
+    print()
+    print(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix())
+    print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix())))
+
+    import ipdb; ipdb.set_trace()
 
 
 if __name__ == "__main__":
-    if True:
-        # SE3 test
-        import pytransform3d.transformations as pt
-        import pytransform3d.rotations as pr
-        import numpy as np
+    test_se3()
 
-        T = pt.random_transform(np.random.default_rng(None))
-        print("original", T)
-        print()
-        print("pytransform3d", pt.exponential_coordinates_from_transform(T))
-        print("pytorch3d", se3_logmap(torch.tensor(T[None,]).float()))
-        print()
-        print("pytransform3d", pt.transform_from_exponential_coordinates(pt.exponential_coordinates_from_transform(T)))
-        print("pytorch3d", se3_expmap(se3_logmap(torch.tensor(T[None,]).float())))
-        print()
-        print(se3_inv(torch.tensor(T)[None,].float()))
-        print(pt.invert_transform(T))
-
-        import ipdb; ipdb.set_trace()
-
-    if True:
-        # Sim3 test
-        import lietorch
-
-        print(lietorch.Sim3.exp(torch.tensor([[0,0,0,0,0,0,0.]])).matrix())
-        #                  scale  rot   trans              trans   rot scale
-        print(torch.tensor([[0., 0,0,0, 0,3,0]]))
-        print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 0.]])).matrix()))
-        print(torch.tensor([[0., 0,2,0, 0,3,0]]))
-        print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 0.]])).matrix()))
-        print(torch.tensor([[1., 0,0,0, 0,3,0]]))
-        print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 1.]])).matrix()))
-        print(torch.tensor([[1., 0,2,0, 0,3,0]]))
-        print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix()))
-        print()
-        print(torch.tensor([[1., 0,0,0, 0,0,2]]))
-        print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix()))
-        print()
-        print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 0.]])).matrix())
-        print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 0.]])).matrix())))
-        print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 0.]])).matrix())
-        print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 0.]])).matrix())))
-        print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 1.]])).matrix())
-        print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 1.]])).matrix())))
-        print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix())
-        print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix())))
-        print()
-        print(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix())
-        print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix())))
-
-        import ipdb; ipdb.set_trace()
+    test_sim3()
