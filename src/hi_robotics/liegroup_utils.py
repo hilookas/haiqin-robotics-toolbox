@@ -12,43 +12,6 @@ import torch
 from torch.autograd.function import Function, FunctionCtx
 
 
-def one_minus_cos(theta: torch.Tensor):
-    # 1. - torch.cos(theta)
-    return 2. * (torch.sin(0.5 * theta) ** 2) # Better numeric stability
-
-
-def one_minus_sinc(theta: torch.Tensor, eps = 1e-2):
-    # 1. - torch.sinc(theta / torch.pi)
-    return torch.where(torch.abs(theta) < eps,
-        theta**2 / 6. - theta**4 / 120. + theta**6 / 5040. - theta**8 / 362880., # Taylor expansion for better numeric stability
-        1. - torch.sinc(theta / torch.pi)
-    )
-
-
-# Plot one_minus_sinc vs taylor
-def plot_one_minus_sinc():
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    thetas = np.logspace(-13, 0, 101).astype(np.float32)
-    # non_taylor - taylor
-    diff = np.abs(one_minus_sinc(torch.tensor(thetas), eps=0) - one_minus_sinc(torch.tensor(thetas), eps=100)).numpy()
-
-    print(torch.tensor(thetas))
-    print(one_minus_sinc(torch.tensor(thetas), eps=0))
-    print(one_minus_sinc(torch.tensor(thetas), eps=100))
-
-    plt.figure()
-    plt.plot(thetas, diff, label="one_minus_sinc - taylor")
-    plt.legend()
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.ylim((1e-20, 1e-1))
-    plt.savefig("one_minus_sinc_vs_taylor.png")
-
-# plot_one_minus_sinc()
-
-
 def so3_vee(h: torch.Tensor) -> torch.Tensor:
     """
     Compute the inverse Hat operator [1] of a batch of 3x3 matrices.
@@ -105,6 +68,14 @@ def so3_hat(phi: torch.Tensor) -> torch.Tensor:
     return torch.stack([zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=-1).view(phi.shape + (3,)) # shape == (N,3,3)
 
 
+def _get_so3_v_c(theta: torch.Tensor):
+    # (1. - torch.cos(theta)) / (theta**2)
+    return torch.where(theta**2 == 0,
+        torch.tensor(0.5, dtype=theta.dtype, device=theta.device).unsqueeze(0), # TODO tayler expansion
+        2. * (torch.sin(0.5 * theta) ** 2) / (theta**2) # Better numeric stability
+    )
+
+
 def so3_expmap(phi: torch.Tensor) -> torch.Tensor:
     """
     Convert a batch of logarithmic representations of rotation matrices `phi`
@@ -131,16 +102,13 @@ def so3_expmap(phi: torch.Tensor) -> torch.Tensor:
 
     theta = torch.norm(phi, dim=-1)
 
-    B = torch.sinc(theta / torch.pi)
-    C = torch.where(theta**2 == 0,
-        torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        one_minus_cos(theta) / (theta**2)
-    )
+    b = torch.sinc(theta / torch.pi)
+    c = _get_so3_v_c(theta)
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
 
-    return I + B * W + C * WW
+    return I + b * W + c * WW
 
 
 def test_so3_expmap():
@@ -315,26 +283,52 @@ def test_so3_logmap():
 test_so3_logmap()
 
 
+def _get_se3_v_c(theta: torch.Tensor, eps = 1e-2):
+    # 1. - torch.sin(theta) / theta
+    return torch.where(torch.abs(theta) < eps,
+        1. / 6. - theta**2 / 120. + theta**4 / 5040. - theta**6 / 362880., # Taylor expansion for better numeric stability
+        1. - torch.sinc(theta / torch.pi)
+    )
+
+
+# Plot _get_se3_v_c vs taylor
+def plot__get_se3_v_c():
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    thetas = np.logspace(-13, 0, 101).astype(np.float32)
+    # non_taylor - taylor
+    diff = np.abs(_get_se3_v_c(torch.tensor(thetas), eps=0) - _get_se3_v_c(torch.tensor(thetas), eps=100)).numpy()
+
+    print(torch.tensor(thetas))
+    print(_get_se3_v_c(torch.tensor(thetas), eps=0))
+    print(_get_se3_v_c(torch.tensor(thetas), eps=100))
+
+    plt.figure()
+    plt.plot(thetas, diff, label="_get_se3_v_c - taylor")
+    plt.legend()
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.ylim((1e-20, 1e-1))
+    plt.savefig("_get_se3_v_c_vs_taylor.png")
+
+# plot__get_se3_v_c()
+
+
 # Copy from: https://github.com/princeton-vl/lietorch/blob/e7df86554156b36846008d8ddbcc4d8521a16554/lietorch/include/rxso3.h
 # See: https://github.com/borglab/gtsam/blob/ef33d45aea433da506447759ec949af30dc8e38f/gtsam/geometry/Similarity3.cpp
 # See: https://jinyongjeong.github.io/Download/SE3/jlblanco2010geometry3d_techrep.pdf
 
 
-def _se3_get_v_param(theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _get_se3_v_abc(theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # See: "Lie Groups for 2D and 3D Transformations" pp. 10
     a = torch.tensor(1., dtype=theta.dtype, device=theta.device).unsqueeze(0)
-    b = torch.where(theta**2 == 0,
-        torch.tensor(0.5, dtype=theta.dtype, device=theta.device).unsqueeze(0),
-        one_minus_cos(theta) / (theta**2),
-    )
-    c = torch.where(theta**2 == 0,
-        torch.tensor(1. / 6., dtype=theta.dtype, device=theta.device).unsqueeze(0),
-        one_minus_sinc(theta) / (theta**2),
-    )
+    b = _get_so3_v_c(theta)
+    c = _get_se3_v_c(theta)
     return a, b, c
 
 
-def _get_v_inv_param(theta: torch.Tensor, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _get_v_inv_def(theta: torch.Tensor, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # See: https://www.notion.so/hilookas/2d93c52e9ba58091ba6def60f248d132
     d = 1 / a
     e = - b / ((a - theta**2 * c)**2 + theta**2 * b**2)
@@ -401,7 +395,7 @@ def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
 
     theta = torch.norm(phi, dim=-1) # shape == (B,)
 
-    a, b, c = _se3_get_v_param(theta)
+    a, b, c = _get_se3_v_abc(theta)
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
@@ -489,7 +483,7 @@ def se3_logmap(transform: torch.Tensor) -> torch.Tensor:
 
     theta = torch.norm(phi, dim=-1)
 
-    d, e, f = _get_v_inv_param(theta, *_se3_get_v_param(theta))
+    d, e, f = _get_v_inv_def(theta, *_get_se3_v_abc(theta))
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
@@ -583,23 +577,17 @@ def sim3_get_v_param(theta: torch.Tensor, sigma: torch.Tensor) -> tuple[torch.Te
         torch.expm1(sigma) / sigma,
     )
     b = torch.where(torch.abs(sigma) < EPS,
-        torch.where(torch.abs(theta) < EPS,
-            torch.tensor(0.5, dtype=theta.dtype, device=theta.device).unsqueeze(0),
-            one_minus_cos(theta) / (theta**2),
-        ),
+        _get_so3_v_c(theta),
         torch.where(torch.abs(theta) < EPS,
             (sigma*torch.expm1(sigma) + sigma - torch.expm1(sigma)) / sigma**2,
-            (sigma*torch.expm1(sigma)*torch.sin(theta) + sigma*torch.sin(theta) + theta*torch.expm1(sigma)*one_minus_cos(theta) - theta*torch.expm1(sigma) + theta*one_minus_cos(theta)) / (theta*(sigma**2 + theta**2)),
+            (torch.exp(sigma) * (sigma * torch.sin(theta) - theta * torch.cos(theta)) + theta) / (theta * theta + sigma * sigma) / theta,
         ),
     )
     c = torch.where(torch.abs(sigma) < EPS,
-        torch.where(torch.abs(theta) < EPS,
-            torch.tensor(1. / 6., dtype=theta.dtype, device=theta.device).unsqueeze(0),
-            (theta - torch.sin(theta)) / theta**3,
-        ),
+        _get_se3_v_c(theta),
         torch.where(torch.abs(theta) < EPS,
             (0.5*sigma**2*torch.expm1(sigma) + 0.5*sigma**2 - sigma*torch.expm1(sigma) + sigma + torch.expm1(sigma)) / sigma**3,
-            (sigma**2*torch.expm1(sigma)*one_minus_cos(theta) - sigma**2*torch.expm1(sigma) + sigma**2*one_minus_cos(theta) - sigma*theta*torch.expm1(sigma)*torch.sin(theta) - sigma*theta*torch.sin(theta) + sigma**2*torch.expm1(sigma) + theta**2*torch.expm1(sigma)) / (sigma*theta**2*(sigma**2 + theta**2)),
+            (torch.expm1(sigma) / sigma - (torch.exp(sigma) * (sigma * torch.cos(theta) + theta * torch.sin(theta)) - sigma) / (theta * theta + sigma * sigma)) / (theta * theta),
         ),
     )
 
@@ -649,7 +637,7 @@ def sim3_logmap(T: torch.Tensor):
 
     theta = torch.norm(phi, dim=-1) # shape == (B,)
 
-    d, e, f = _get_v_inv_param(theta, *sim3_get_v_param(theta, sigma))
+    d, e, f = _get_v_inv_def(theta, *sim3_get_v_param(theta, sigma))
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
