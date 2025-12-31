@@ -11,12 +11,42 @@ import torch
 
 from torch.autograd.function import Function, FunctionCtx
 
-EPS = 1e-6
-
 
 def one_minus_cos(theta: torch.Tensor):
     # 1. - torch.cos(theta)
     return 2. * (torch.sin(0.5 * theta) ** 2) # Better numeric stability
+
+
+def one_minus_sinc(theta: torch.Tensor, eps = 1e-2):
+    # 1. - torch.sinc(theta / torch.pi)
+    return torch.where(torch.abs(theta) < eps,
+        theta**2 / 6. - theta**4 / 120. + theta**6 / 5040. - theta**8 / 362880., # Taylor expansion for better numeric stability
+        1. - torch.sinc(theta / torch.pi)
+    )
+
+
+# Plot one_minus_sinc vs taylor
+def plot_one_minus_sinc():
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    thetas = np.logspace(-13, 0, 101).astype(np.float32)
+    # non_taylor - taylor
+    diff = np.abs(one_minus_sinc(torch.tensor(thetas), eps=0) - one_minus_sinc(torch.tensor(thetas), eps=100)).numpy()
+
+    print(torch.tensor(thetas))
+    print(one_minus_sinc(torch.tensor(thetas), eps=0))
+    print(one_minus_sinc(torch.tensor(thetas), eps=100))
+
+    plt.figure()
+    plt.plot(thetas, diff, label="one_minus_sinc - taylor")
+    plt.legend()
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.ylim((1e-20, 1e-1))
+    plt.savefig("one_minus_sinc_vs_taylor.png")
+
+# plot_one_minus_sinc()
 
 
 def so3_vee(h: torch.Tensor) -> torch.Tensor:
@@ -290,6 +320,27 @@ test_so3_logmap()
 # See: https://jinyongjeong.github.io/Download/SE3/jlblanco2010geometry3d_techrep.pdf
 
 
+def _se3_get_v_param(theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # See: "Lie Groups for 2D and 3D Transformations" pp. 10
+    a = torch.tensor(1., dtype=theta.dtype, device=theta.device).unsqueeze(0)
+    b = torch.where(theta**2 == 0,
+        torch.tensor(0.5, dtype=theta.dtype, device=theta.device).unsqueeze(0),
+        one_minus_cos(theta) / (theta**2),
+    )
+    c = torch.where(theta**2 == 0,
+        torch.tensor(1. / 6., dtype=theta.dtype, device=theta.device).unsqueeze(0),
+        one_minus_sinc(theta) / (theta**2),
+    )
+    return a, b, c
+
+
+def _get_v_inv_param(theta: torch.Tensor, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # See: https://www.notion.so/hilookas/2d93c52e9ba58091ba6def60f248d132
+    d = 1 / a
+    e = - b / ((a - theta**2 * c)**2 + theta**2 * b**2)
+    f = (b**2 + theta**2 * c**2 - a * c) / (a * ((a - theta**2 * c)**2 + theta**2 * b**2))
+    return d, e, f
+
 
 def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
     """
@@ -350,22 +401,14 @@ def se3_expmap(log_transform: torch.Tensor) -> torch.Tensor:
 
     theta = torch.norm(phi, dim=-1) # shape == (B,)
 
-    A = torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0)
-    B = torch.where(theta**2 == 0,
-        torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        one_minus_cos(theta) / (theta**2),
-    )
-    C = torch.where(torch.abs(theta) < EPS,
-        torch.tensor(1. / 6., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        (1. - torch.sinc(theta / torch.pi)) / (theta**2),
-    )
+    a, b, c = _se3_get_v_param(theta)
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
-    V = A * I + B * W + C * WW # shape == (B,3,3)
+    V = a * I + b * W + c * WW # shape == (B,3,3)
 
     # translation is V @ T
-    T = (V @ log_translation[:, :, None])[:, :, 0]
+    T = (V @ log_translation.unsqueeze(-1)).squeeze(-1)
 
     transform = torch.zeros(
         N, 4, 4, dtype=log_transform.dtype, device=log_transform.device
@@ -446,18 +489,13 @@ def se3_logmap(transform: torch.Tensor) -> torch.Tensor:
 
     theta = torch.norm(phi, dim=-1)
 
-    A = torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0)
-    B = torch.tensor(-0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0)
-    C = torch.where(torch.abs(theta) < EPS,
-        torch.tensor(1. / 12., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        (theta * torch.sin(theta) + 2. * torch.cos(theta) - 2.) / (2. * theta**2 * (torch.cos(theta) - 1.)), # theta接近0的时候，
-    )
+    d, e, f = _get_v_inv_param(theta, *_se3_get_v_param(theta))
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
-    V_inv = A * I + B * W + C * WW
+    V_inv = d * I + e * W + f * WW
 
-    log_translation = (V_inv @ T[:, :, None])[:, :, 0]
+    log_translation = (V_inv @ T.unsqueeze(-1)).squeeze(-1)
 
     return torch.cat((phi, log_translation), dim=1)
 
@@ -479,7 +517,7 @@ def se3_inv(A: torch.Tensor) -> torch.Tensor:
     R = A[:, :3, :3]
     t = A[:, :3, 3]
     R_inv = R.permute(0, 2, 1)
-    t_inv = -(R_inv @ t[:, :, None])[:, :, 0]
+    t_inv = -(R_inv @ t.unsqueeze(-1)).squeeze(-1)
     A_inv = torch.zeros_like(A)
     A_inv[:, :3, :3] = R_inv
     A_inv[:, :3, 3] = t_inv
@@ -532,50 +570,40 @@ def sim3_inv(A: torch.Tensor) -> torch.Tensor:
 # See: https://github.com/borglab/gtsam/blob/ef33d45aea433da506447759ec949af30dc8e38f/gtsam/geometry/Similarity3.cpp
 
 
-def sim3_logmap(T: torch.Tensor):
-    # To get the logmap, calculate phi and sigma, then solve for u as shown by Ethan at
-    # See: https://www.ethaneade.org/latex2html/lie/node29.html
-    # See: https://www.ethaneade.com/lie.pdf
-    # See: https://www.cis.upenn.edu/~jean/interp-SIM.pdf
-    s = torch.norm(T[:, :3, :3], dim=(1,2)) / torch.sqrt(torch.tensor(3.0, dtype=T.dtype, device=T.device).unsqueeze(0)) # shape == (B,)
-    R = T[:, :3, :3] / s.unsqueeze(-1).unsqueeze(-1) # shape == (B,3,3)
-    t = T[:, :3, 3] # shape == (B,3)
+def sim3_get_v_param(theta: torch.Tensor, sigma: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Not same as "Lie Groups for 2D and 3D Transformations" pp. 22
+    # Different defination of sigma
 
-    sigma = torch.log(s) # shape == (B,)
-    phi = so3_logmap(R) # shape == (B,3)
+    # TODO Use taylor expansion for better numeric stability when sigma/theta is small for a, b, c
 
-    theta = torch.norm(phi, dim=-1) # shape == (B,)
+    EPS = 1e-6
 
-    A = torch.where(torch.abs(sigma) < EPS,
-        1. - 0.5 * sigma,
-        sigma / torch.expm1(sigma),
+    a = torch.where(torch.abs(sigma) < EPS,
+        torch.tensor(1., dtype=theta.dtype, device=theta.device).unsqueeze(0),
+        torch.expm1(sigma) / sigma,
     )
-    B = torch.where(torch.abs(sigma) < EPS,
-        torch.tensor(-0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
+    b = torch.where(torch.abs(sigma) < EPS,
         torch.where(torch.abs(theta) < EPS,
-            (-sigma + torch.expm1(sigma) - sigma*torch.expm1(sigma)) / torch.expm1(sigma)**2,
-            (-sigma*torch.expm1(sigma)*torch.sin(theta) - sigma*torch.sin(theta) - theta*torch.expm1(sigma)*one_minus_cos(theta) + theta*torch.expm1(sigma) - theta*one_minus_cos(theta)) / (theta*(torch.expm1(sigma)**2 + 2.0*torch.expm1(sigma)*one_minus_cos(theta) + 2.0*one_minus_cos(theta))),
-        ),
-    )
-    C = torch.where(torch.abs(sigma) < EPS,
-        torch.where(torch.abs(theta) < EPS,
-            torch.tensor(1. / 12., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-            -0.5*torch.sin(theta) / (theta*one_minus_cos(theta)) + 1.0/theta**2,
+            torch.tensor(0.5, dtype=theta.dtype, device=theta.device).unsqueeze(0),
+            one_minus_cos(theta) / (theta**2),
         ),
         torch.where(torch.abs(theta) < EPS,
-            (sigma + 0.5*sigma*torch.expm1(sigma)**2 - torch.expm1(sigma)**2 + 1.5*sigma*torch.expm1(sigma) - torch.expm1(sigma)) / torch.expm1(sigma)**3,
-            (sigma*torch.expm1(sigma)**2*one_minus_cos(theta) + 3.0*sigma*torch.expm1(sigma)*one_minus_cos(theta) + 2.0*sigma*one_minus_cos(theta) - theta*torch.expm1(sigma)**2*torch.sin(theta) - theta*torch.expm1(sigma)*torch.sin(theta)) / (theta**2*(torch.expm1(sigma)**2 + 2.0*torch.expm1(sigma)*one_minus_cos(theta) + 2.0*one_minus_cos(theta))*torch.expm1(sigma)),
+            (sigma*torch.expm1(sigma) + sigma - torch.expm1(sigma)) / sigma**2,
+            (sigma*torch.expm1(sigma)*torch.sin(theta) + sigma*torch.sin(theta) + theta*torch.expm1(sigma)*one_minus_cos(theta) - theta*torch.expm1(sigma) + theta*one_minus_cos(theta)) / (theta*(sigma**2 + theta**2)),
         ),
     )
-    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
-    W = so3_hat(phi)
-    WW = W @ W
-    V_inv = A * I + B * W + C * WW
+    c = torch.where(torch.abs(sigma) < EPS,
+        torch.where(torch.abs(theta) < EPS,
+            torch.tensor(1. / 6., dtype=theta.dtype, device=theta.device).unsqueeze(0),
+            (theta - torch.sin(theta)) / theta**3,
+        ),
+        torch.where(torch.abs(theta) < EPS,
+            (0.5*sigma**2*torch.expm1(sigma) + 0.5*sigma**2 - sigma*torch.expm1(sigma) + sigma + torch.expm1(sigma)) / sigma**3,
+            (sigma**2*torch.expm1(sigma)*one_minus_cos(theta) - sigma**2*torch.expm1(sigma) + sigma**2*one_minus_cos(theta) - sigma*theta*torch.expm1(sigma)*torch.sin(theta) - sigma*theta*torch.sin(theta) + sigma**2*torch.expm1(sigma) + theta**2*torch.expm1(sigma)) / (sigma*theta**2*(sigma**2 + theta**2)),
+        ),
+    )
 
-    rho = (V_inv @ t.unsqueeze(-1)).squeeze(-1) # shape == (B,3)
-
-    v = torch.concat([ sigma.unsqueeze(-1), phi, rho ], dim=-1)
-    return v
+    return a, b, c
 
 
 def sim3_expmap(v: torch.Tensor):
@@ -591,34 +619,11 @@ def sim3_expmap(v: torch.Tensor):
 
     theta = torch.norm(phi, dim=-1) # shape == (B,)
 
-    A = torch.where(torch.abs(sigma) < EPS,
-        torch.tensor(1., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-        torch.expm1(sigma) / sigma,
-    )
-    B = torch.where(torch.abs(sigma) < EPS,
-        torch.where(torch.abs(theta) < EPS,
-            torch.tensor(0.5, dtype=phi.dtype, device=phi.device).unsqueeze(0),
-            one_minus_cos(theta) / (theta**2),
-        ),
-        torch.where(torch.abs(theta) < EPS,
-            (sigma*torch.expm1(sigma) + sigma - torch.expm1(sigma)) / sigma**2,
-            (sigma*torch.expm1(sigma)*torch.sin(theta) + sigma*torch.sin(theta) + theta*torch.expm1(sigma)*one_minus_cos(theta) - theta*torch.expm1(sigma) + theta*one_minus_cos(theta)) / (theta*(sigma**2 + theta**2)),
-        ),
-    )
-    C = torch.where(torch.abs(sigma) < EPS,
-        torch.where(torch.abs(theta) < EPS,
-            torch.tensor(1. / 6., dtype=phi.dtype, device=phi.device).unsqueeze(0),
-            (theta - torch.sin(theta)) / theta**3,
-        ),
-        torch.where(torch.abs(theta) < EPS,
-            (0.5*sigma**2*torch.expm1(sigma) + 0.5*sigma**2 - sigma*torch.expm1(sigma) + sigma + torch.expm1(sigma)) / sigma**3,
-            (sigma**2*torch.expm1(sigma)*one_minus_cos(theta) - sigma**2*torch.expm1(sigma) + sigma**2*one_minus_cos(theta) - sigma*theta*torch.expm1(sigma)*torch.sin(theta) - sigma*theta*torch.sin(theta) + sigma**2*torch.expm1(sigma) + theta**2*torch.expm1(sigma)) / (sigma*theta**2*(sigma**2 + theta**2)),
-        ),
-    )
+    a, b, c = sim3_get_v_param(theta, sigma)
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
-    V = A * I + B * W + C * WW # shape == (B,3,3)
+    V = a * I + b * W + c * WW # shape == (B,3,3)
 
     t = (V @ rho.unsqueeze(-1)).squeeze(-1) # shape == (B,3)
     s = torch.exp(sigma) # shape == (B,)
@@ -628,6 +633,32 @@ def sim3_expmap(v: torch.Tensor):
     T[:, :3, 3] = t
     T[:, 3, 3] = 1.0
     return T
+
+
+def sim3_logmap(T: torch.Tensor):
+    # To get the logmap, calculate phi and sigma, then solve for u as shown by Ethan at
+    # See: https://www.ethaneade.org/latex2html/lie/node29.html
+    # See: https://www.ethaneade.com/lie.pdf
+    # See: https://www.cis.upenn.edu/~jean/interp-SIM.pdf
+    s = torch.norm(T[:, :3, :3], dim=(1,2)) / torch.sqrt(torch.tensor(3.0, dtype=T.dtype, device=T.device).unsqueeze(0)) # shape == (B,)
+    R = T[:, :3, :3] / s.unsqueeze(-1).unsqueeze(-1) # shape == (B,3,3)
+    t = T[:, :3, 3] # shape == (B,3)
+
+    sigma = torch.log(s) # shape == (B,)
+    phi = so3_logmap(R) # shape == (B,3)
+
+    theta = torch.norm(phi, dim=-1) # shape == (B,)
+
+    d, e, f = _get_v_inv_param(theta, *sim3_get_v_param(theta, sigma))
+    I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
+    W = so3_hat(phi)
+    WW = W @ W
+    V_inv = d * I + e * W + f * WW
+
+    rho = (V_inv @ t.unsqueeze(-1)).squeeze(-1) # shape == (B,3)
+
+    v = torch.concat([ sigma.unsqueeze(-1), phi, rho ], dim=-1)
+    return v
 
 
 def simplify_with_sympy():
@@ -663,18 +694,14 @@ def test_se3():
     import numpy as np
 
     T = pt.random_transform(np.random.default_rng(None))
-    print("original", T)
-    print()
-    print("pytransform3d", pt.exponential_coordinates_from_transform(T))
-    print("pytorch3d", se3_logmap(torch.tensor(T[None,]).float()))
-    print()
-    print("pytransform3d", pt.transform_from_exponential_coordinates(pt.exponential_coordinates_from_transform(T)))
-    print("pytorch3d", se3_expmap(se3_logmap(torch.tensor(T[None,]).float())))
-    print()
-    print(se3_inv(torch.tensor(T)[None,].float()))
-    print(pt.invert_transform(T))
 
-    import ipdb; ipdb.set_trace()
+    assert torch.isclose(torch.tensor(pt.exponential_coordinates_from_transform(T), dtype=torch.float32), se3_logmap(torch.tensor(T[None,], dtype=torch.float32))).all()
+
+    assert torch.isclose(torch.tensor(pt.transform_from_exponential_coordinates(pt.exponential_coordinates_from_transform(T)), dtype=torch.float32), se3_expmap(se3_logmap(torch.tensor(T[None,], dtype=torch.float32)))).all()
+
+    assert torch.isclose(torch.tensor(pt.invert_transform(T), dtype=torch.float32), se3_inv(torch.tensor(T, dtype=torch.float32)[None,]))
+
+test_se3()
 
 
 def test_sim3():
@@ -709,8 +736,8 @@ def test_sim3():
 
     import ipdb; ipdb.set_trace()
 
+test_sim3()
+
 
 if __name__ == "__main__":
-    test_se3()
-
-    test_sim3()
+    pass
