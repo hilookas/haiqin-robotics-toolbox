@@ -68,11 +68,10 @@ def so3_hat(phi: torch.Tensor) -> torch.Tensor:
     return torch.stack([zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=-1).view(phi.shape + (3,)) # shape == (N,3,3)
 
 
-def _get_so3_v_c(theta: torch.Tensor):
-    # (1. - torch.cos(theta)) / (theta**2)
-    return torch.where(theta**2 == 0,
-        torch.tensor(0.5, dtype=theta.dtype, device=theta.device).unsqueeze(0), # TODO tayler expansion
-        2. * (torch.sin(0.5 * theta) ** 2) / (theta**2) # Better numeric stability
+def _get_so3_v_c(theta: torch.Tensor, eps = 1e-2):
+    return torch.where(torch.abs(theta) < eps, # TODO test
+        1/2 - theta**2/24 + theta**4/720 - theta**6/40320, # Tayler expansion for better numeric stability
+        (1. - torch.cos(theta)) / theta**2,
     )
 
 
@@ -156,7 +155,7 @@ def so3_logmap(R: torch.Tensor, eps: float = None) -> torch.Tensor:
     n = (R + torch.eye(3, dtype=R.dtype, device=R.device).unsqueeze(0)) * 0.5
     n_norm = torch.norm(n, dim=-1, keepdim=True)
 
-    return torch.where(torch.pi - theta < eps,
+    return torch.where(torch.abs(torch.pi - theta) < eps,
         theta * (n / n_norm)[:,torch.argmax(n_norm)],
         sin_theta_axis / torch.sinc(theta / torch.pi)
     )
@@ -284,10 +283,9 @@ test_so3_logmap()
 
 
 def _get_se3_v_c(theta: torch.Tensor, eps = 1e-2):
-    # 1. - torch.sin(theta) / theta
     return torch.where(torch.abs(theta) < eps,
-        1. / 6. - theta**2 / 120. + theta**4 / 5040. - theta**6 / 362880., # Taylor expansion for better numeric stability
-        1. - torch.sinc(theta / torch.pi)
+        1/6 - theta**2/120 + theta**4/5040 - theta**6/362880, # Taylor expansion for better numeric stability
+        (1. - torch.sin(theta) / theta) / theta**2
     )
 
 
@@ -564,29 +562,32 @@ def sim3_inv(A: torch.Tensor) -> torch.Tensor:
 # See: https://github.com/borglab/gtsam/blob/ef33d45aea433da506447759ec949af30dc8e38f/gtsam/geometry/Similarity3.cpp
 
 
-def sim3_get_v_param(theta: torch.Tensor, sigma: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _get_sim3_v_abc(theta: torch.Tensor, sigma: torch.Tensor, eps = 1e-2) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Not same as "Lie Groups for 2D and 3D Transformations" pp. 22
     # Different defination of sigma
+    # See: https://www.notion.so/hilookas/2d93c52e9ba58091ba6def60f248d132
 
-    # TODO Use taylor expansion for better numeric stability when sigma/theta is small for a, b, c
-
-    EPS = 1e-6
-
-    a = torch.where(torch.abs(sigma) < EPS,
-        torch.tensor(1., dtype=theta.dtype, device=theta.device).unsqueeze(0),
+    a = torch.where(torch.abs(sigma) < eps,
+        1 + sigma/2 + sigma**2/6 + sigma**3/24 + sigma**4/120 + sigma**5/720 + sigma**6/5040 + sigma**7/40320,
         torch.expm1(sigma) / sigma,
     )
-    b = torch.where(torch.abs(sigma) < EPS,
-        _get_so3_v_c(theta),
-        torch.where(torch.abs(theta) < EPS,
-            (sigma*torch.expm1(sigma) + sigma - torch.expm1(sigma)) / sigma**2,
+    b = torch.where(torch.abs(sigma) < eps,
+        torch.where(torch.abs(theta) < eps,
+            1/2 - theta**2/24 + sigma/3 - sigma*theta**2/30 + sigma**2/8 - sigma**2*theta**2/72 + sigma**3/30 - sigma**3*theta**2/252,
+            theta**(-2) - torch.cos(theta)/theta**2 + sigma*(-torch.cos(theta)/theta**2 + torch.sin(theta)/theta**3) + sigma**2*(-torch.cos(theta)/(2*theta**2) + torch.sin(theta)/theta**3 + torch.cos(theta)/theta**4 - 1/theta**4) + sigma**3*(-torch.cos(theta)/(6*theta**2) + torch.sin(theta)/(2*theta**3) + torch.cos(theta)/theta**4 - torch.sin(theta)/theta**5),
+        ),
+        torch.where(torch.abs(theta) < eps,
+            sigma**(-2) - torch.exp(sigma)/sigma**2 + torch.exp(sigma)/sigma + theta**2*(-torch.exp(sigma)/(6*sigma) + torch.exp(sigma)/(2*sigma**2) - torch.exp(sigma)/sigma**3 + torch.exp(sigma)/sigma**4 - 1/sigma**4),
             (torch.exp(sigma) * (sigma * torch.sin(theta) - theta * torch.cos(theta)) + theta) / (theta * theta + sigma * sigma) / theta,
         ),
     )
-    c = torch.where(torch.abs(sigma) < EPS,
-        _get_se3_v_c(theta),
-        torch.where(torch.abs(theta) < EPS,
-            (0.5*sigma**2*torch.expm1(sigma) + 0.5*sigma**2 - sigma*torch.expm1(sigma) + sigma + torch.expm1(sigma)) / sigma**3,
+    c = torch.where(torch.abs(sigma) < eps,
+        torch.where(torch.abs(theta) < eps,
+            1/6 - theta**2/120 + sigma/8 - sigma*theta**2/144 + sigma**2/20 - sigma**2*theta**2/336 + sigma**3/72 - sigma**3*theta**2/1152 ,
+            -torch.sin(theta)/theta**3 + theta**(-2) + sigma*(1/(2*theta**2) - torch.sin(theta)/theta**3 - torch.cos(theta)/theta**4 + theta**(-4)) + sigma**2*(1/(6*theta**2) - torch.sin(theta)/(2*theta**3) - torch.cos(theta)/theta**4 + torch.sin(theta)/theta**5) + sigma**3*(1/(24*theta**2) - torch.sin(theta)/(6*theta**3) - torch.cos(theta)/(2*theta**4) + torch.sin(theta)/theta**5 + torch.cos(theta)/theta**6 - 1/theta**6),
+        ),
+        torch.where(torch.abs(theta) < eps,
+            (sigma**5*torch.exp(sigma)/2 - sigma**4*torch.exp(sigma) + sigma**3*torch.exp(sigma) - sigma**3)/sigma**6 + theta**2*(-torch.exp(sigma)/(24*sigma) + torch.exp(sigma)/(6*sigma**2) - torch.exp(sigma)/(2*sigma**3) + torch.exp(sigma)/sigma**4 - torch.exp(sigma)/sigma**5 + sigma**(-5)),
             (torch.expm1(sigma) / sigma - (torch.exp(sigma) * (sigma * torch.cos(theta) + theta * torch.sin(theta)) - sigma) / (theta * theta + sigma * sigma)) / (theta * theta),
         ),
     )
@@ -607,7 +608,7 @@ def sim3_expmap(v: torch.Tensor):
 
     theta = torch.norm(phi, dim=-1) # shape == (B,)
 
-    a, b, c = sim3_get_v_param(theta, sigma)
+    a, b, c = _get_sim3_v_abc(theta, sigma)
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
@@ -637,7 +638,7 @@ def sim3_logmap(T: torch.Tensor):
 
     theta = torch.norm(phi, dim=-1) # shape == (B,)
 
-    d, e, f = _get_v_inv_def(theta, *sim3_get_v_param(theta, sigma))
+    d, e, f = _get_v_inv_def(theta, *_get_sim3_v_abc(theta, sigma))
     I = torch.eye(3, dtype=phi.dtype, device=phi.device).unsqueeze(0)
     W = so3_hat(phi)
     WW = W @ W
@@ -649,30 +650,46 @@ def sim3_logmap(T: torch.Tensor):
     return v
 
 
-def simplify_with_sympy():
+def sympy_series():
     import sympy as sp
 
     class sp_expm1(sp.Function):
         def fdiff(self, argindex=1):
             return sp.exp(self.args[0])
 
-    class sp_one_minus_cos(sp.Function):
-        def fdiff(self, argindex=1):
-            return sp.sin(self.args[0])
-
     sigma, theta = sp.symbols('sigma theta', real=True)
 
-    expr = (-sigma * (sp_expm1(sigma) + 1.) + (sp_expm1(sigma) + 1.) - 1.) / (sp_expm1(sigma) * sp_expm1(sigma))
+    expr = ((sp.exp(sigma) - 1) / sigma - (sp.exp(sigma) * (sigma * sp.cos(theta) + theta * sp.sin(theta)) - sigma) / (theta * theta + sigma * sigma)) / (theta * theta)
 
-    simplified_expr = sp.simplify(sp.expand(expr))
+    taylor_theta = sp.series(expr, theta, 0, 1, "+")
 
-    print(sp.latex(simplified_expr))
-    print(simplified_expr)
+    # expr_diff = sp.diff(expr)
+    # print("expr_diff", expr_diff.evalf(subs={'theta': 0}))
+    # print(sp.limit(expr_diff, theta, 0, "+"))
+    # print(sp.limit(expr, theta, 0, "+"))
+
+    taylor_sigma = sp.series(expr, sigma, 0, 4, "+")
+
+    taylor_theta_sigma = sp.series(sp.series(expr, theta, 0, 4, "+").removeO(), sigma, 0, 4, "+").removeO().expand().simplify()
+
+    taylor_sigma_theta = sp.series(sp.series(expr, sigma, 0, 4, "+").removeO(), theta, 0, 4, "+").removeO().expand().simplify()
+
+    print(taylor_theta)
+    print(taylor_sigma)
+    print(taylor_theta_sigma)
+    print(taylor_sigma_theta)
+
+    # print(sp.latex(simplified_expr))
+    # print(simplified_expr)
 
     # print(expr.diff(x))   # exp(x)
     # f = lambdify(x, expr)
     # print(f(1))        # 1.718281828459045
     # print(f(1e-20))    # 1e-20, unlike exp(x)-1 which would evaluate to 0
+
+    import ipdb; ipdb.set_trace()
+
+# sympy_series()
 
 
 def test_se3():
@@ -687,7 +704,7 @@ def test_se3():
 
     assert torch.isclose(torch.tensor(pt.transform_from_exponential_coordinates(pt.exponential_coordinates_from_transform(T)), dtype=torch.float32), se3_expmap(se3_logmap(torch.tensor(T[None,], dtype=torch.float32)))).all()
 
-    assert torch.isclose(torch.tensor(pt.invert_transform(T), dtype=torch.float32), se3_inv(torch.tensor(T, dtype=torch.float32)[None,]))
+    assert torch.isclose(torch.tensor(pt.invert_transform(T), dtype=torch.float32), se3_inv(torch.tensor(T, dtype=torch.float32)[None,])).all()
 
 test_se3()
 
@@ -703,6 +720,7 @@ def test_sim3():
     print(torch.tensor([[0., 0,2,0, 0,3,0]]))
     print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 0.]])).matrix()))
     print(torch.tensor([[1., 0,0,0, 0,3,0]]))
+    import ipdb; ipdb.set_trace()
     print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 1.]])).matrix()))
     print(torch.tensor([[1., 0,2,0, 0,3,0]]))
     print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix()))
