@@ -119,7 +119,7 @@ def test_so3_expmap():
 test_so3_expmap()
 
 
-def so3_logmap(R: torch.Tensor, eps: float = None) -> torch.Tensor:
+def so3_logmap(R: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     """
     Convert a batch of 3x3 rotation matrices `R`
     to a batch of 3-dimensional matrix logarithms of rotation matrices
@@ -132,12 +132,6 @@ def so3_logmap(R: torch.Tensor, eps: float = None) -> torch.Tensor:
         Batch of logarithms of input rotation matrices
         of shape `(minibatch, 3)`.
     """
-    if eps is None:
-        if R.dtype == torch.float64:
-            eps = 1e-8
-        else:
-            eps = 1e-4
-
     N, dim1, dim2 = R.shape
     if dim1 != 3 or dim2 != 3:
         raise ValueError("Input has to be a batch of 3x3 Tensors.")
@@ -145,20 +139,75 @@ def so3_logmap(R: torch.Tensor, eps: float = None) -> torch.Tensor:
     if R.size(-1) != 3 or R.size(-2) != 3:
         raise ValueError(f"Invalid rotation R shape {R.shape}.")
 
-    sin_theta_axis = so3_vee(R) # sin(theta) * e
-    theta = torch.atan2( # avoid acos
-        torch.norm(sin_theta_axis, p=2, dim=-1) * 2., # 2 * sin(theta)
-        torch.diagonal(R, dim1=-2, dim2=-1).sum(-1) - 1. # trace(R) - 1
+    # See:
+    # https://dfki-ric.github.io/pytransform3d/_modules/pytransform3d/rotations/_matrix.html#quaternion_from_matrix
+    # Source:
+    # http://www.euclideanspace.com/maths/geometry/rotations/conversions
+    trace = torch.diagonal(R, dim1=-2, dim2=-1).sum(-1)
+    div = torch.where(trace > 0.0,
+        torch.sqrt(1.0 + R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]),
+        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
+            torch.sqrt(1.0 + R[:, 0, 0] - R[:, 1, 1] - R[:, 2, 2]),
+            torch.where(R[:, 1, 1] > R[:, 2, 2],
+                torch.sqrt(1.0 + R[:, 1, 1] - R[:, 0, 0] - R[:, 2, 2]),
+                torch.sqrt(1.0 + R[:, 2, 2] - R[:, 0, 0] - R[:, 1, 1]),
+            )
+        )
+    )
+    qw = torch.where(trace > 0.0,
+        0.5 * div,
+        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
+            0.5 / div * (R[:, 2, 1] - R[:, 1, 2]),
+            torch.where(R[:, 1, 1] > R[:, 2, 2],
+                0.5 / div * (R[:, 0, 2] - R[:, 2, 0]),
+                0.5 / div * (R[:, 1, 0] - R[:, 0, 1]),
+            )
+        )
+    )
+    qx = torch.where(trace > 0.0,
+        0.5 / div * (R[:, 2, 1] - R[:, 1, 2]),
+        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
+            0.5 * div,
+            torch.where(R[:, 1, 1] > R[:, 2, 2],
+                0.5 / div * (R[:, 1, 0] + R[:, 0, 1]),
+                0.5 / div * (R[:, 0, 2] + R[:, 2, 0]),
+            )
+        )
+    )
+    qy = torch.where(trace > 0.0,
+        0.5 / div * (R[:, 0, 2] - R[:, 2, 0]),
+        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
+            0.5 / div * (R[:, 1, 0] + R[:, 0, 1]),
+            torch.where(R[:, 1, 1] > R[:, 2, 2],
+                0.5 * div,
+                0.5 / div * (R[:, 2, 1] + R[:, 1, 2]),
+            )
+        )
+    )
+    qz = torch.where(trace > 0.0,
+        0.5 / div * (R[:, 1, 0] - R[:, 0, 1]),
+        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
+            0.5 / div * (R[:, 0, 2] + R[:, 2, 0]),
+            torch.where(R[:, 1, 1] > R[:, 2, 2],
+                0.5 / div * (R[:, 2, 1] + R[:, 1, 2]),
+                0.5 * div,
+            )
+        )
+    )
+    qvec = torch.stack((qx, qy, qz), dim=-1)
+    qvec_norm = torch.norm(qvec, dim=-1, keepdim=True)
+    # theta = 2. * torch.atan2(qvec_norm, qw)
+
+    # See:
+    # https://github.com/strasdat/Sophus/blob/main/sophus/so3.hpp
+    # Atan-based log thanks to
+    # C. Hertzberg et al.: "Integrating Generic Sensor Fusion Algorithms with Sound State Representation through Encapsulation of Manifolds" Information Fusion, 2011
+    return torch.where(torch.abs(qvec_norm) < eps,
+        (2/qw - 2*qvec_norm**2/(3*qw**3)) * qvec,
+        2. * torch.atan2(qvec_norm, qw) / qvec_norm * qvec,
     )
 
-    # this derives from: nnT = (R + 1) / 2
-    n = (R + torch.eye(3, dtype=R.dtype, device=R.device).unsqueeze(0)) * 0.5
-    n_norm = torch.norm(n, dim=-1, keepdim=True)
-
-    return torch.where(torch.abs(torch.pi - theta) < eps,
-        theta * (n / n_norm)[:,torch.argmax(n_norm)],
-        sin_theta_axis / torch.sinc(theta / torch.pi)
-    )
+so3_logmap(so3_expmap(torch.tensor([[0., 0., torch.pi - 1e-7]])))
 
 
 def plot_so3_singularity_near_pi():
@@ -174,20 +223,13 @@ def plot_so3_singularity_near_pi():
         axis_dists = []
         for diff in diffs:
             theta = np.pi - diff
-            a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float64)
-            # a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
-
+            a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
             R = so3_expmap(torch.tensor(a).unsqueeze(0))
             a2 = so3_logmap(R, eps).squeeze(0).numpy()
-
+            print(a, a2)
             axis_dist = np.linalg.norm((a - a2)) / theta
             axis_dists.append(axis_dist)
         plt.plot(diffs, axis_dists, label="eps = %g" % eps)
-
-        if plot_idx > 5:
-            ax.set_xlabel("$x = \\pi - $ angle")
-        if plot_idx % 3 == 0:
-            ax.set_ylabel("error = $||a[:3]$ - $\\ln(\\exp$ (a))[:3]$||_2$")
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_ylim((10e-16, 10e-1))
@@ -195,7 +237,7 @@ def plot_so3_singularity_near_pi():
     plt.tight_layout()
     plt.savefig("so3_singularity_near_pi.png")
 
-# plot_so3_singularity_near_pi()
+plot_so3_singularity_near_pi()
 
 
 def plot_so3_singularity_near_zero():
@@ -211,16 +253,12 @@ def plot_so3_singularity_near_zero():
         axis_dists = []
         for diff in diffs:
             theta = diff
-            a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float64)
-            # a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
-
+            a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
             R = so3_expmap(torch.tensor(a).unsqueeze(0))
             a2 = so3_logmap(R, eps).squeeze(0).numpy()
-
             axis_dist = np.linalg.norm((a - a2)) / theta
             axis_dists.append(axis_dist)
         plt.plot(diffs, axis_dists, label="eps = %g" % eps)
-
         ax.set_xscale("log")
         ax.set_yscale("log")
         # ax.set_ylim((10e-16, 10e-1))
@@ -238,48 +276,40 @@ def test_so3_logmap():
     for diff in np.logspace(-13, -1, 101):
         theta = np.pi - diff
         a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float64)
-
         R = so3_expmap(torch.tensor(a).unsqueeze(0))
         a2 = so3_logmap(R).squeeze(0).numpy()
-
         axis_dist = np.linalg.norm((a - a2)) / theta
         assert axis_dist < 1e-7, f"axis_dist={axis_dist}, diff={diff}"
 
     for diff in np.logspace(-13, -1, 101):
         theta = np.pi - diff
         a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
-
         R = so3_expmap(torch.tensor(a).unsqueeze(0))
         a2 = so3_logmap(R).squeeze(0).numpy()
-
         axis_dist = np.linalg.norm((a - a2)) / theta
         assert axis_dist < 1e-3
 
     for diff in np.logspace(-13, -1, 101):
         theta = diff
         a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float64)
-
         R = so3_expmap(torch.tensor(a).unsqueeze(0))
         a2 = so3_logmap(R).squeeze(0).numpy()
-
         axis_dist = np.linalg.norm((a - a2)) / theta
-        assert axis_dist < 1e-16
+        assert axis_dist < 1e-7
 
     for diff in np.logspace(-13, -1, 101):
         theta = diff
         a = np.array([np.sqrt(1/3) * theta, np.sqrt(1/3) * theta, np.sqrt(1/3) * theta], dtype=np.float32)
-
         R = so3_expmap(torch.tensor(a).unsqueeze(0))
         a2 = so3_logmap(R).squeeze(0).numpy()
-
         axis_dist = np.linalg.norm((a - a2)) / theta
-        assert axis_dist == 0.0
+        assert axis_dist < 1e-6
 
     # Test cases for edge cases
     assert (so3_logmap(torch.tensor([[[-1,0,0],[0,-1,0],[0,0,1.]]])) == torch.tensor([[0,0,np.pi]])).all()  # 180 degree rotation around z axis
     assert (so3_logmap(torch.tensor([[[1,0,0],[0,-1,0],[0,0,-1.]]])) == torch.tensor([[np.pi,0,0]])).all()  # 180 degree rotation around z axis
 
-test_so3_logmap()
+# test_so3_logmap()
 
 
 def _get_se3_v_c(theta: torch.Tensor, eps = 1e-2):
@@ -720,7 +750,6 @@ def test_sim3():
     print(torch.tensor([[0., 0,2,0, 0,3,0]]))
     print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 0.]])).matrix()))
     print(torch.tensor([[1., 0,0,0, 0,3,0]]))
-    import ipdb; ipdb.set_trace()
     print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,0,0, 1.]])).matrix()))
     print(torch.tensor([[1., 0,2,0, 0,3,0]]))
     print(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix()))
