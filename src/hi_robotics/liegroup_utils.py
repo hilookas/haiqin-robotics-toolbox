@@ -110,7 +110,7 @@ def so3_expmap(phi: torch.Tensor) -> torch.Tensor:
     return I + b * W + c * WW
 
 
-def so3_logmap(R: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+def so3_logmap(R: torch.Tensor, eps: float = 1e-2) -> torch.Tensor:
     """
     Convert a batch of 3x3 rotation matrices `R`
     to a batch of 3-dimensional matrix logarithms of rotation matrices
@@ -194,7 +194,7 @@ def so3_logmap(R: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     # Atan-based log thanks to
     # C. Hertzberg et al.: "Integrating Generic Sensor Fusion Algorithms with Sound State Representation through Encapsulation of Manifolds" Information Fusion, 2011
     return torch.where(torch.abs(qvec_norm) < eps,
-        (2/qw - 2*qvec_norm**2/(3*qw**3)) * qvec,
+        (2/qw - 2*qvec_norm**2/(3*qw**3) + 2*qvec_norm**4/(5*qw**5) - 2*qvec_norm**6/(7*qw**7)) * qvec,
         2. * torch.atan2(qvec_norm, qw) / qvec_norm * qvec,
     )
 
@@ -410,7 +410,7 @@ def se3_inv(A: torch.Tensor) -> torch.Tensor:
     return A_inv
 
 
-def sim3_inv(A: torch.Tensor) -> torch.Tensor:
+def sim3_inv(A: torch.Tensor, eps = 1e-8) -> torch.Tensor:
     """
     sim3_inv
 
@@ -431,12 +431,10 @@ def sim3_inv(A: torch.Tensor) -> torch.Tensor:
     norm_sR = torch.norm(sR, dim=(-2, -1))  # (...,) 计算每个sR的Frobenius范数
     s = norm_sR / torch.sqrt(torch.tensor(3.0, device=sR.device, dtype=sR.dtype))
 
-    EPS = 1e-8
-
-    R = sR / (s[..., None, None] + EPS)  # (..., 3, 3)  还原纯旋转矩阵
+    R = sR / (s[..., None, None] + eps)  # (..., 3, 3)  还原纯旋转矩阵
     R_inv = R.permute(*tuple(range(R.ndim-2)), -1, -2)  # (..., 3, 3)  R^T，适配任意批量维度
 
-    inv_s = 1.0 / (s + EPS)
+    inv_s = 1.0 / (s + eps)
     sR_inv = inv_s[..., None, None] * R_inv  # (..., 3, 3)
 
     t_inv = -torch.matmul(sR_inv, t[..., None])[..., 0]  # (..., 3)

@@ -108,7 +108,7 @@ def test_so3_logmap():
     assert (so3_logmap(torch.tensor([[[-1,0,0],[0,-1,0],[0,0,1.]]])) == torch.tensor([[0,0,np.pi]])).all()  # 180 degree rotation around z axis
     assert (so3_logmap(torch.tensor([[[1,0,0],[0,-1,0],[0,0,-1.]]])) == torch.tensor([[np.pi,0,0]])).all()  # 180 degree rotation around z axis
 
-# test_so3_logmap()
+test_so3_logmap()
 
 
 # Plot _get_se3_v_c vs taylor
@@ -181,8 +181,6 @@ def test_sim3():
     print()
     print(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix())
     print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix())))
-
-    import ipdb; ipdb.set_trace()
 
 test_sim3()
 
