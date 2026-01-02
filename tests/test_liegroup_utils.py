@@ -6,6 +6,15 @@ def test_so3_expmap():
     print(so3_expmap(torch.tensor([[0., 0., 1e-13]])))
     print(so3_logmap(so3_expmap(torch.tensor([[0., 0., torch.pi - 1e-7]]))))
 
+    # Test qw<0 case
+    T = torch.tensor([[-0.461787  , -0.65355307, -0.59968424,  1.0573529 ],
+        [-0.7365759 ,  0.6592276 , -0.15124471, -1.2207874 ],
+        [ 0.49417484,  0.3718701 , -0.78581417, -1.0142126 ],
+        [ 0.        ,  0.        ,  0.        ,  1.        ]],
+        dtype=torch.float32)
+    R = torch.tensor(T[:3, :3]).unsqueeze(0)
+    assert torch.isclose(so3_logmap(R), torch.tensor([[ 1.0710949897766113, -2.2397129535675049, -0.1699919551610947]], dtype=torch.float32)).all()
+
 test_so3_expmap()
 
 
@@ -86,7 +95,7 @@ def test_so3_logmap():
         R = so3_expmap(torch.tensor(a).unsqueeze(0))
         a2 = so3_logmap(R).squeeze(0).numpy()
         axis_dist = np.linalg.norm((a - a2)) / theta
-        assert axis_dist < 1e-3
+        assert axis_dist < 1e-6
 
     for diff in np.logspace(-13, -1, 101):
         theta = diff
@@ -141,16 +150,33 @@ def test_se3():
     import pytransform3d.rotations as pr
     import numpy as np
 
-    T = pt.random_transform(np.random.default_rng(None))
+    for i in range(100):
+        T = pt.random_transform(np.random.default_rng(None)).astype(np.float32)
+        log = pt.exponential_coordinates_from_transform(T).astype(np.float32)
 
-    assert torch.isclose(torch.tensor(pt.exponential_coordinates_from_transform(T), dtype=torch.float32), se3_logmap(torch.tensor(T[None,], dtype=torch.float32))).all()
+        try:
+            assert torch.isclose(
+                torch.tensor(log),
+                se3_logmap(torch.tensor(T).unsqueeze(0)),
+                atol=1e-7
+            ).all()
 
-    assert torch.isclose(torch.tensor(pt.transform_from_exponential_coordinates(pt.exponential_coordinates_from_transform(T)), dtype=torch.float32), se3_expmap(se3_logmap(torch.tensor(T[None,], dtype=torch.float32)))).all()
+            assert torch.isclose(
+                torch.tensor(pt.transform_from_exponential_coordinates(log).astype(np.float32)),
+                se3_expmap(torch.tensor(log).unsqueeze(0)),
+                atol=1e-7
+            ).all()
 
-    assert torch.isclose(torch.tensor(pt.invert_transform(T), dtype=torch.float32), se3_inv(torch.tensor(T, dtype=torch.float32)[None,])).all()
+            assert torch.isclose(
+                torch.tensor(pt.invert_transform(T).astype(np.float32)),
+                se3_inv(torch.tensor(T).unsqueeze(0)),
+                atol=1e-7
+            ).all()
+        except AssertionError:
+            import ipdb; ipdb.set_trace()
+            pass
 
 test_se3()
-
 
 def test_sim3():
     # Sim3 test
@@ -179,8 +205,9 @@ def test_sim3():
     print(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix())
     print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,3,0, 0,2,0, 1.]])).matrix())))
     print()
-    print(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix())
-    print(sim3_expmap(sim3_logmap(lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix())))
+    T = lietorch.Sim3.exp(torch.tensor([[0,0,2, 0,0,0, 1.]])).matrix()
+    assert torch.isclose(T, sim3_expmap(sim3_logmap(T))).all()
+    # import ipdb; ipdb.set_trace()
 
 test_sim3()
 

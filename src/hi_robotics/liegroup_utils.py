@@ -189,13 +189,22 @@ def so3_logmap(R: torch.Tensor, eps: float = 1e-2) -> torch.Tensor:
     qvec_norm = torch.norm(qvec, dim=-1, keepdim=True)
     # theta = 2. * torch.atan2(qvec_norm, qw)
 
-    # See:
-    # https://github.com/strasdat/Sophus/blob/main/sophus/so3.hpp
-    # Atan-based log thanks to
-    # C. Hertzberg et al.: "Integrating Generic Sensor Fusion Algorithms with Sound State Representation through Encapsulation of Manifolds" Information Fusion, 2011
+    # See: https://github.com/strasdat/Sophus/blob/main/sophus/so3.hpp
+    # Atan-based log thanks to C. Hertzberg et al.: "Integrating Generic Sensor Fusion Algorithms with Sound State Representation through Encapsulation of Manifolds" Information Fusion, 2011
     return torch.where(torch.abs(qvec_norm) < eps,
         (2/qw - 2*qvec_norm**2/(3*qw**3) + 2*qvec_norm**4/(5*qw**5) - 2*qvec_norm**6/(7*qw**7)) * qvec,
-        2. * torch.atan2(qvec_norm, qw) / qvec_norm * qvec,
+        torch.where(qw >= 0,
+            # w < 0 ==> cos(theta/2) < 0 ==> theta > pi
+            #
+            # By convention, the condition |theta| < pi is imposed by wrapping theta
+            # to pi; The wrap operation can be folded inside evaluation of atan2
+            #
+            # theta - pi = atan(sin(theta - pi), cos(theta - pi))
+            #            = atan(-sin(theta), -cos(theta))
+            #
+            2. * torch.atan2(qvec_norm, qw) / qvec_norm * qvec,
+            2. * torch.atan2(-qvec_norm, -qw) / qvec_norm * qvec,
+        )
     )
 
 
