@@ -69,10 +69,16 @@ def so3_hat(phi: torch.Tensor) -> torch.Tensor:
 
 
 def _get_so3_v_c(theta: torch.Tensor, eps = 1e-2):
-    return torch.where(torch.abs(theta) < eps, # TODO test
-        1/2 - theta**2/24 + theta**4/720 - theta**6/40320, # Tayler expansion for better numeric stability
-        (1. - torch.cos(theta)) / theta**2,
-    )
+    # torch where will cause NaN in backward if we do not handle the zero case here
+    # See: https://discuss.pytorch.org/t/gradients-of-torch-where/26835
+    mask0 = torch.abs(theta) < eps # TODO test
+    mask1 = ~mask0
+    theta0 = theta[mask0]
+    theta1 = theta[mask1]
+    c = torch.empty_like(theta)
+    c[mask0] = 1/2 - theta0**2/24 + theta0**4/720 - theta0**6/40320 # Tayler expansion for better numeric stability
+    c[mask1] = (1. - torch.cos(theta1)) / theta1**2
+    return c
 
 
 def so3_expmap(phi: torch.Tensor) -> torch.Tensor:
@@ -135,84 +141,82 @@ def so3_logmap(R: torch.Tensor, eps: float = 1e-2) -> torch.Tensor:
     # Source:
     # http://www.euclideanspace.com/maths/geometry/rotations/conversions
     trace = torch.diagonal(R, dim1=-2, dim2=-1).sum(-1)
-    div = torch.where(trace > 0.0,
-        torch.sqrt(1.0 + R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]),
-        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
-            torch.sqrt(1.0 + R[:, 0, 0] - R[:, 1, 1] - R[:, 2, 2]),
-            torch.where(R[:, 1, 1] > R[:, 2, 2],
-                torch.sqrt(1.0 + R[:, 1, 1] - R[:, 0, 0] - R[:, 2, 2]),
-                torch.sqrt(1.0 + R[:, 2, 2] - R[:, 0, 0] - R[:, 1, 1]),
-            )
-        )
-    )
-    qw = torch.where(trace > 0.0,
-        0.5 * div,
-        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
-            0.5 / div * (R[:, 2, 1] - R[:, 1, 2]),
-            torch.where(R[:, 1, 1] > R[:, 2, 2],
-                0.5 / div * (R[:, 0, 2] - R[:, 2, 0]),
-                0.5 / div * (R[:, 1, 0] - R[:, 0, 1]),
-            )
-        )
-    )
-    qx = torch.where(trace > 0.0,
-        0.5 / div * (R[:, 2, 1] - R[:, 1, 2]),
-        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
-            0.5 * div,
-            torch.where(R[:, 1, 1] > R[:, 2, 2],
-                0.5 / div * (R[:, 1, 0] + R[:, 0, 1]),
-                0.5 / div * (R[:, 0, 2] + R[:, 2, 0]),
-            )
-        )
-    )
-    qy = torch.where(trace > 0.0,
-        0.5 / div * (R[:, 0, 2] - R[:, 2, 0]),
-        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
-            0.5 / div * (R[:, 1, 0] + R[:, 0, 1]),
-            torch.where(R[:, 1, 1] > R[:, 2, 2],
-                0.5 * div,
-                0.5 / div * (R[:, 2, 1] + R[:, 1, 2]),
-            )
-        )
-    )
-    qz = torch.where(trace > 0.0,
-        0.5 / div * (R[:, 1, 0] - R[:, 0, 1]),
-        torch.where((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]),
-            0.5 / div * (R[:, 0, 2] + R[:, 2, 0]),
-            torch.where(R[:, 1, 1] > R[:, 2, 2],
-                0.5 / div * (R[:, 2, 1] + R[:, 1, 2]),
-                0.5 * div,
-            )
-        )
-    )
+    mask0 = trace > 0.0
+    mask1 = ~mask0 & ((R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2]))
+    mask2 = ~mask0 & ~mask1 & (R[:, 1, 1] > R[:, 2, 2])
+    mask3 = ~mask0 & ~mask1 & ~mask2
+
+    qw = torch.empty_like(trace)
+    qx = torch.empty_like(trace)
+    qy = torch.empty_like(trace)
+    qz = torch.empty_like(trace)
+
+    div = torch.sqrt(1.0 + R[mask0, 0, 0] + R[mask0, 1, 1] + R[mask0, 2, 2])
+    qw[mask0] = 0.5 * div
+    qx[mask0] = 0.5 / div * (R[mask0, 2, 1] - R[mask0, 1, 2])
+    qy[mask0] = 0.5 / div * (R[mask0, 0, 2] - R[mask0, 2, 0])
+    qz[mask0] = 0.5 / div * (R[mask0, 1, 0] - R[mask0, 0, 1])
+
+    div = torch.sqrt(1.0 + R[mask1, 0, 0] - R[mask1, 1, 1] - R[mask1, 2, 2])
+    qw[mask1] = 0.5 / div * (R[mask1, 2, 1] - R[mask1, 1, 2])
+    qx[mask1] = 0.5 * div
+    qy[mask1] = 0.5 / div * (R[mask1, 1, 0] + R[mask1, 0, 1])
+    qz[mask1] = 0.5 / div * (R[mask1, 0, 2] + R[mask1, 2, 0])
+
+    div = torch.sqrt(1.0 + R[mask2, 1, 1] - R[mask2, 0, 0] - R[mask2, 2, 2])
+    qw[mask2] = 0.5 / div * (R[mask2, 0, 2] - R[mask2, 2, 0])
+    qx[mask2] = 0.5 / div * (R[mask2, 1, 0] + R[mask2, 0, 1])
+    qy[mask2] = 0.5 * div
+    qz[mask2] = 0.5 / div * (R[mask2, 2, 1] + R[mask2, 1, 2])
+
+    div = torch.sqrt(1.0 + R[mask3, 2, 2] - R[mask3, 0, 0] - R[mask3, 1, 1])
+    qw[mask3] = 0.5 / div * (R[mask3, 1, 0] - R[mask3, 0, 1])
+    qx[mask3] = 0.5 / div * (R[mask3, 0, 2] + R[mask3, 2, 0])
+    qy[mask3] = 0.5 / div * (R[mask3, 2, 1] + R[mask3, 1, 2])
+    qz[mask3] = 0.5 * div
+
     qvec = torch.stack((qx, qy, qz), dim=-1)
-    qvec_norm = torch.norm(qvec, dim=-1, keepdim=True)
+    qvec_norm = torch.norm(qvec, dim=-1)
     # theta = 2. * torch.atan2(qvec_norm, qw)
 
     # See: https://github.com/strasdat/Sophus/blob/main/sophus/so3.hpp
     # Atan-based log thanks to C. Hertzberg et al.: "Integrating Generic Sensor Fusion Algorithms with Sound State Representation through Encapsulation of Manifolds" Information Fusion, 2011
-    return torch.where(torch.abs(qvec_norm) < eps,
-        (2/qw - 2*qvec_norm**2/(3*qw**3) + 2*qvec_norm**4/(5*qw**5) - 2*qvec_norm**6/(7*qw**7)) * qvec,
-        torch.where(qw >= 0,
-            # w < 0 ==> cos(theta/2) < 0 ==> theta > pi
-            #
-            # By convention, the condition |theta| < pi is imposed by wrapping theta
-            # to pi; The wrap operation can be folded inside evaluation of atan2
-            #
-            # theta - pi = atan(sin(theta - pi), cos(theta - pi))
-            #            = atan(-sin(theta), -cos(theta))
-            #
-            2. * torch.atan2(qvec_norm, qw) / qvec_norm * qvec,
-            2. * torch.atan2(-qvec_norm, -qw) / qvec_norm * qvec,
-        )
-    )
+    maskkk0 = torch.abs(qvec_norm) < eps
+    maskkk10 = ~maskkk0 & (qw < 0)
+    maskkk11 = ~maskkk0 & ~maskkk10
+    qw0 = qw[maskkk0]
+    qw10 = qw[maskkk10]
+    qw11 = qw[maskkk11]
+    qvec_norm0 = qvec_norm[maskkk0]
+    qvec_norm10 = qvec_norm[maskkk10]
+    qvec_norm11 = qvec_norm[maskkk11]
+
+    qvec_ratio = torch.empty_like(qvec_norm)
+
+    qvec_ratio[maskkk0] = 2/qw0 - 2*qvec_norm0**2/(3*qw0**3) + 2*qvec_norm0**4/(5*qw0**5) - 2*qvec_norm0**6/(7*qw0**7)
+    # w < 0 ==> cos(theta/2) < 0 ==> theta > pi
+    #
+    # By convention, the condition |theta| < pi is imposed by wrapping theta
+    # to pi; The wrap operation can be folded inside evaluation of atan2
+    #
+    # theta - pi = atan(sin(theta - pi), cos(theta - pi))
+    #            = atan(-sin(theta), -cos(theta))
+    #
+    qvec_ratio[maskkk10] = 2. * torch.atan2(-qvec_norm10, -qw10) / qvec_norm10
+    qvec_ratio[maskkk11] = 2. * torch.atan2(qvec_norm11, qw11) / qvec_norm11
+
+    return qvec_ratio * qvec
 
 
 def _get_se3_v_c(theta: torch.Tensor, eps = 1e-2):
-    return torch.where(torch.abs(theta) < eps,
-        1/6 - theta**2/120 + theta**4/5040 - theta**6/362880, # Taylor expansion for better numeric stability
-        (1. - torch.sin(theta) / theta) / theta**2
-    )
+    mask0 = torch.abs(theta) < eps
+    mask1 = ~mask0
+    theta0 = theta[mask0]
+    theta1 = theta[mask1]
+    c = torch.empty_like(theta)
+    c[mask0] = 1/6 - theta0**2/120 + theta0**4/5040 - theta0**6/362880 # Taylor expansion for better numeric stability
+    c[mask1] = (1. - torch.sin(theta1) / theta1) / theta1**2
+    return c
 
 
 # Copy from: https://github.com/princeton-vl/lietorch/blob/e7df86554156b36846008d8ddbcc4d8521a16554/lietorch/include/rxso3.h
@@ -467,30 +471,45 @@ def _get_sim3_v_abc(theta: torch.Tensor, sigma: torch.Tensor, eps = 1e-2) -> tup
     # Different defination of sigma
     # See: https://www.notion.so/hilookas/2d93c52e9ba58091ba6def60f248d132
 
-    a = torch.where(torch.abs(sigma) < eps,
-        1 + sigma/2 + sigma**2/6 + sigma**3/24 + sigma**4/120 + sigma**5/720 + sigma**6/5040 + sigma**7/40320,
-        torch.expm1(sigma) / sigma,
-    )
-    b = torch.where(torch.abs(sigma) < eps,
-        torch.where(torch.abs(theta) < eps,
-            1/2 - theta**2/24 + sigma/3 - sigma*theta**2/30 + sigma**2/8 - sigma**2*theta**2/72 + sigma**3/30 - sigma**3*theta**2/252,
-            theta**(-2) - torch.cos(theta)/theta**2 + sigma*(-torch.cos(theta)/theta**2 + torch.sin(theta)/theta**3) + sigma**2*(-torch.cos(theta)/(2*theta**2) + torch.sin(theta)/theta**3 + torch.cos(theta)/theta**4 - 1/theta**4) + sigma**3*(-torch.cos(theta)/(6*theta**2) + torch.sin(theta)/(2*theta**3) + torch.cos(theta)/theta**4 - torch.sin(theta)/theta**5),
-        ),
-        torch.where(torch.abs(theta) < eps,
-            sigma**(-2) - torch.exp(sigma)/sigma**2 + torch.exp(sigma)/sigma + theta**2*(-torch.exp(sigma)/(6*sigma) + torch.exp(sigma)/(2*sigma**2) - torch.exp(sigma)/sigma**3 + torch.exp(sigma)/sigma**4 - 1/sigma**4),
-            (torch.exp(sigma) * (sigma * torch.sin(theta) - theta * torch.cos(theta)) + theta) / (theta * theta + sigma * sigma) / theta,
-        ),
-    )
-    c = torch.where(torch.abs(sigma) < eps,
-        torch.where(torch.abs(theta) < eps,
-            1/6 - theta**2/120 + sigma/8 - sigma*theta**2/144 + sigma**2/20 - sigma**2*theta**2/336 + sigma**3/72 - sigma**3*theta**2/1152 ,
-            -torch.sin(theta)/theta**3 + theta**(-2) + sigma*(1/(2*theta**2) - torch.sin(theta)/theta**3 - torch.cos(theta)/theta**4 + theta**(-4)) + sigma**2*(1/(6*theta**2) - torch.sin(theta)/(2*theta**3) - torch.cos(theta)/theta**4 + torch.sin(theta)/theta**5) + sigma**3*(1/(24*theta**2) - torch.sin(theta)/(6*theta**3) - torch.cos(theta)/(2*theta**4) + torch.sin(theta)/theta**5 + torch.cos(theta)/theta**6 - 1/theta**6),
-        ),
-        torch.where(torch.abs(theta) < eps,
-            (sigma**5*torch.exp(sigma)/2 - sigma**4*torch.exp(sigma) + sigma**3*torch.exp(sigma) - sigma**3)/sigma**6 + theta**2*(-torch.exp(sigma)/(24*sigma) + torch.exp(sigma)/(6*sigma**2) - torch.exp(sigma)/(2*sigma**3) + torch.exp(sigma)/sigma**4 - torch.exp(sigma)/sigma**5 + sigma**(-5)),
-            (torch.expm1(sigma) / sigma - (torch.exp(sigma) * (sigma * torch.cos(theta) + theta * torch.sin(theta)) - sigma) / (theta * theta + sigma * sigma)) / (theta * theta),
-        ),
-    )
+    mask0_sigma = torch.abs(sigma) < eps
+    mask1_sigma = ~mask0_sigma
+    mask0_theta = torch.abs(theta) < eps
+    mask1_theta = ~mask0_theta
+
+    mask00 = mask0_sigma & mask0_theta
+    mask01 = mask0_sigma & mask1_theta
+    mask10 = mask1_sigma & mask0_theta
+    mask11 = mask1_sigma & mask1_theta
+
+    sigma00 = sigma[mask00]
+    sigma01 = sigma[mask01]
+    sigma10 = sigma[mask10]
+    sigma11 = sigma[mask11]
+
+    theta00 = theta[mask00]
+    theta01 = theta[mask01]
+    theta10 = theta[mask10]
+    theta11 = theta[mask11]
+
+    a = torch.empty_like(sigma)
+    b = torch.empty_like(sigma)
+    c = torch.empty_like(sigma)
+
+    a[mask00] = 1 + sigma00/2 + sigma00**2/6 + sigma00**3/24 + sigma00**4/120 + sigma00**5/720 + sigma00**6/5040 + sigma00**7/40320
+    b[mask00] = 1/2 - theta00**2/24 + sigma00/3 - sigma00*theta00**2/30 + sigma00**2/8 - sigma00**2*theta00**2/72 + sigma00**3/30 - sigma00**3*theta00**2/252
+    c[mask00] = 1/6 - theta00**2/120 + sigma00/8 - sigma00*theta00**2/144 + sigma00**2/20 - sigma00**2*theta00**2/336 + sigma00**3/72 - sigma00**3*theta00**2/1152
+
+    a[mask01] = 1 + sigma01/2 + sigma01**2/6 + sigma01**3/24 + sigma01**4/120 + sigma01**5/720 + sigma01**6/5040 + sigma01**7/40320
+    b[mask01] = theta01**(-2) - torch.cos(theta01)/theta01**2 + sigma01*(-torch.cos(theta01)/theta01**2 + torch.sin(theta01)/theta01**3) + sigma01**2*(-torch.cos(theta01)/(2*theta01**2) + torch.sin(theta01)/theta01**3 + torch.cos(theta01)/theta01**4 - 1/theta01**4) + sigma01**3*(-torch.cos(theta01)/(6*theta01**2) + torch.sin(theta01)/(2*theta01**3) + torch.cos(theta01)/theta01**4 - torch.sin(theta01)/theta01**5)
+    c[mask01] = -torch.sin(theta01)/theta01**3 + theta01**(-2) + sigma01*(1/(2*theta01**2) - torch.sin(theta01)/theta01**3 - torch.cos(theta01)/theta01**4 + theta01**(-4)) + sigma01**2*(1/(6*theta01**2) - torch.sin(theta01)/(2*theta01**3) - torch.cos(theta01)/theta01**4 + torch.sin(theta01)/theta01**5) + sigma01**3*(1/(24*theta01**2) - torch.sin(theta01)/(6*theta01**3) - torch.cos(theta01)/(2*theta01**4) + torch.sin(theta01)/theta01**5 + torch.cos(theta01)/theta01**6 - 1/theta01**6)
+
+    a[mask10] = torch.expm1(sigma10) / sigma10
+    b[mask10] = sigma10**(-2) - torch.exp(sigma10)/sigma10**2 + torch.exp(sigma10)/sigma10 + theta10**2*(-torch.exp(sigma10)/(6*sigma10) + torch.exp(sigma10)/(2*sigma10**2) - torch.exp(sigma10)/sigma10**3 + torch.exp(sigma10)/sigma10**4 - 1/sigma10**4)
+    c[mask10] = (sigma10**5*torch.exp(sigma10)/2 - sigma10**4*torch.exp(sigma10) + sigma10**3*torch.exp(sigma10) - sigma10**3)/sigma10**6 + theta10**2*(-torch.exp(sigma10)/(24*sigma10) + torch.exp(sigma10)/(6*sigma10**2) - torch.exp(sigma10)/(2*sigma10**3) + torch.exp(sigma10)/sigma10**4 - torch.exp(sigma10)/sigma10**5 + sigma10**(-5))
+
+    a[mask11] = torch.expm1(sigma11) / sigma11
+    b[mask11] = (torch.exp(sigma11) * (sigma11 * torch.sin(theta11) - theta11 * torch.cos(theta11)) + theta11) / (theta11 * theta11 + sigma11 * sigma11) / theta11
+    c[mask11] = (torch.expm1(sigma11) / sigma11 - (torch.exp(sigma11) * (sigma11 * torch.cos(theta11) + theta11 * torch.sin(theta11)) - sigma11) / (theta11 * theta11 + sigma11 * sigma11)) / (theta11 * theta11)
 
     return a, b, c
 
